@@ -4,11 +4,19 @@
 
 - Visual Studio 2026 Community or Build Tools
 - Desktop development with C++ workload
+- .NET desktop development workload
 - CMake 4.2 or newer
 - Windows SDK
+- .NET 10 SDK (selected by `global.json`)
 - PowerShell 7 or Windows PowerShell 5.1
 
-.NET 10 and the .NET desktop workload are needed only when the WPF milestone begins.
+The native build is x64-only. Required Steinberg ASIO interface files are
+vendored under `third_party/asio`, so a separate SDK installation is not
+needed. Physical testing requires the hardware vendor's 64-bit ASIO driver.
+
+The WPF SDK is part of the Windows .NET SDK; no separate `dotnet workload`
+installation is required. The desktop development workload supplies the Visual
+Studio WPF tooling.
 
 ## Configure, build, and test
 
@@ -17,7 +25,16 @@
 ```
 
 `build.ps1` uses CMake from `PATH` when available and otherwise locates the
-Visual Studio bundled CMake through `vswhere`.
+Visual Studio bundled CMake through `vswhere`. It always builds in this order:
+
+1. configure and build the x64 native C++ targets;
+2. run the native CTest suite when `-Test` is present;
+3. restore and build the .NET 10 WPF application;
+4. build and run the dependency-free managed test executable when `-Test` is present.
+
+The managed tests primarily use an in-process Fake worker and also exercise the
+native JSON worker contract through `fake:loopback`; they do not open an ASIO
+driver.
 
 Release validation:
 
@@ -31,13 +48,60 @@ Clean rebuild:
 .\build.ps1 -Configuration Debug -Test -Clean
 ```
 
+`-Clean` removes only the known native, managed, and publish output directories
+under `out/` after verifying that every path remains inside the repository.
+
+## Run locally
+
+The WPF build output is configuration-specific:
+
+```powershell
+$app = '.\out\dotnet\CapturePanel.App\Debug\net10.0-windows\win-x64\CapturePanel.exe'
+& $app
+```
+
+`capture-panel.exe` must remain beside `CapturePanel.exe`; the WPF application
+starts one short-lived worker process for device discovery, setup tests, and
+captures. To expose `fake:loopback` during UI development:
+
+```powershell
+$env:CAPTURE_PANEL_SHOW_FAKE = '1'
+& $app
+```
+
+The native CLI remains independently usable from
+`out\build\windows-x64\bin\<Configuration>\capture-panel.exe`.
+
+## Publish layout
+
+The release workflow performs a self-contained, untrimmed `win-x64` WPF folder
+publish. The binary ZIP has `CapturePanel.exe` and `capture-panel.exe` in the
+same directory, followed by the .NET runtime files, `LICENSE`,
+`THIRD_PARTY_NOTICES.md`, the Steinberg SDK license, and project documentation.
+The package also preserves the .NET and Windows Desktop Runtime licenses and
+third-party notices selected by the self-contained publish. The corresponding
+tagged source ZIP and `SHA256SUMS` are separate release assets. Hardware vendor
+drivers are never copied into build or publish output.
+
 ## Development rules
 
 - Put platform-independent behavior in `capture_panel_core`.
 - Add Windows/ASIO code only under `src/backends/asio`.
 - Keep the Fake backend behavior deterministic.
-- Do not allocate, log, perform file I/O, or call managed code from a future ASIO callback.
+- Keep the WPF/native boundary on the versioned JSON Lines worker protocol.
+- Keep `capture-panel.exe` adjacent to `CapturePanel.exe` in build and publish output.
+- Do not allocate, lock, log, perform file I/O, or call managed code from an ASIO callback.
 - Add or port a test before changing alignment and verification constants.
 - Public channel numbers are one-based; backend indices are zero-based.
 - Core audio buffers are normalized interleaved float32.
 - Do not commit `out/`, generated Visual Studio files, or `CMakeUserPresets.json`.
+
+## Test boundaries
+
+The normal CTest suite does not open an ASIO driver. It validates the core,
+Fake backend, ASIO sample conversion, buffer timeline, device-ID parsing,
+backend routing, CLI, and JSON worker output. The managed test executable
+validates WPF view-model state, settings, WAV metadata, capture-file promotion,
+and the native JSON worker contract with `fake:loopback`. Native driver
+callbacks and physical routing use the protected manual procedure in
+[HARDWARE_TESTING.md](HARDWARE_TESTING.md).

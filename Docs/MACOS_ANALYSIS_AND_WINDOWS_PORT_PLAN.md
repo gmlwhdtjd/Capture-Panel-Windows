@@ -9,9 +9,9 @@
 - 범위: UI를 제외한 오디오 코어와 CLI
 - 목적: macOS 구현을 그대로 번역하는 것이 아니라, 제품 동작과 검증 알고리즘을 보존하면서 CoreAudio 계층을 Windows ASIO 계층으로 교체하기 위한 기준을 만든다.
 
-> 후속 결정: 네이티브 코어/CLI는 C++20과 CMake로, GUI는 안정된 C ABI 위의 .NET 10 WPF로 구현한다. ASIO를 제외한 전체 코어와 CLI 파이프라인은 결정론적 Fake backend로 이식했다. 이 문서의 미결정 표현과 환경 스냅샷은 당시 분석 기록이며, 현재 결정은 `WINDOWS_ARCHITECTURE.md`, 구현 상태는 `PORT_STATUS.md`를 기준으로 한다.
+> 후속 상태: 네이티브 코어/CLI, Fake backend, ASIO SDK 2.3.4 기반 ASIO backend와 backend router가 구현되었다. Darkglass Anagram 출력 9 → 입력 1 실기기 검증도 통과했다. 이 문서는 구현 전 분석 기록이며 현재 구현은 `WINDOWS_ARCHITECTURE.md`, `ASIO_BACKEND.md`, `PORT_STATUS.md`를 기준으로 한다.
 
-이 문서는 구현 전 분석 결과와 1차 설계 방향을 보존한 역사적 문서다. ASIO SDK 라이선스와 실제 대상 오디오 인터페이스의 드라이버 동작을 확인한 후 일부 세부 설계는 조정될 수 있다.
+이 문서는 구현 전 분석 결과와 1차 설계 방향을 보존한 역사적 문서다. 현재 코드와 다른 미결정 표현은 위의 최신 문서를 우선한다.
 
 ## 1. 결론 요약
 
@@ -321,7 +321,7 @@ CoreAudio가 제공하는 이 aggregate/drift compensation 기능은 Windows ASI
 Windows 모델에서는 다음처럼 바꾼다.
 
 ```text
-DeviceId       = stable string/UUID (ASIO driver name + CLSID 기반)
+DeviceId       = `asio:{canonical CLSID}` (표시 이름은 ID가 아닌 metadata)
 ChannelIndex   = uint32, 공개 CLI는 1-based
 SampleRate     = double
 AudioBuffer    = interleaved normalized float32
@@ -712,14 +712,14 @@ Swift에서 C++로 옮길 때 부동소수 계산 순서와 반올림 차이 때
 ## 15. 첫 구현 전에 확정할 체크리스트
 
 - [x] Capture Panel Windows의 배포 라이선스: GPL-3.0-only
-- [ ] ASIO SDK 취득/보관/CI 주입 방식
+- [x] ASIO SDK 취득/보관 방식: 2.3.4 최소 인터페이스 파일 vendoring
 - [ ] 첫 대상 오디오 인터페이스와 ASIO 드라이버 버전
 - [x] 1차 CPU 아키텍처: x64
 - [x] WAV 입력 지원 범위: PCM 16/24/32, float32, WAVE_FORMAT_EXTENSIBLE
 - [ ] 최대 캡처 길이 또는 메모리 제한
 - [x] CLI의 `--driver` ID: backend가 제공하는 안정 문자열
 - [x] C++ 오류 전달 방식과 테스트 프레임워크: `CaptureError` + CTest 경량 harness
-- [x] 외부 의존성 관리 방식: 코어는 무의존 CMake, ASIO SDK 정책은 후속 확정
+- [x] 외부 의존성 관리 방식: 코어는 무의존 CMake, ASIO 인터페이스 파일은 저장소에 고정
 
 ## 16. 기준 원칙
 

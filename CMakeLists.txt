@@ -7,11 +7,20 @@ project(
     LANGUAGES CXX
 )
 
+if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+    message(FATAL_ERROR "Capture Panel's ASIO host requires 64-bit Windows.")
+endif()
+
 option(CAPTURE_PANEL_BUILD_TESTS "Build Capture Panel tests" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+if(MSVC)
+    # Release archives are self-contained and do not require a separately
+    # installed Visual C++ Redistributable.
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
 
 function(capture_panel_enable_warnings target)
     if(MSVC)
@@ -46,11 +55,48 @@ target_include_directories(capture_panel_fake
 target_link_libraries(capture_panel_fake PUBLIC capture_panel_core)
 capture_panel_enable_warnings(capture_panel_fake)
 
+add_library(capture_panel_asio STATIC
+    src/backends/asio/src/asio_backend.cpp
+    src/backends/asio/src/asio_capture.cpp
+    src/backends/asio/src/asio_driver_registry.cpp
+    src/backends/asio/src/asio_driver_session.cpp
+    src/backends/asio/src/asio_sample_converter.cpp
+)
+target_include_directories(capture_panel_asio
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/backends/asio/include>
+    PRIVATE
+        src/backends/asio/src
+        third_party/asio/common
+)
+target_link_libraries(capture_panel_asio
+    PUBLIC capture_panel_core
+    PRIVATE Advapi32 Ole32 User32
+)
+target_compile_features(capture_panel_asio PUBLIC cxx_std_20)
+capture_panel_enable_warnings(capture_panel_asio)
+
+add_library(capture_panel_backends STATIC
+    src/backends/router/src/backend_router.cpp
+)
+target_include_directories(capture_panel_backends
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/backends/router/include>
+)
+target_link_libraries(capture_panel_backends PUBLIC capture_panel_core)
+capture_panel_enable_warnings(capture_panel_backends)
+
 add_library(capture_panel_cli_lib STATIC
     src/cli/cli.cpp
 )
 target_include_directories(capture_panel_cli_lib PUBLIC src/cli)
-target_link_libraries(capture_panel_cli_lib PUBLIC capture_panel_core capture_panel_fake)
+target_link_libraries(capture_panel_cli_lib
+    PUBLIC
+        capture_panel_core
+        capture_panel_fake
+        capture_panel_asio
+        capture_panel_backends
+)
 target_compile_definitions(
     capture_panel_cli_lib
     PRIVATE CAPTURE_PANEL_VERSION="${PROJECT_VERSION}"
@@ -72,7 +118,11 @@ if(CAPTURE_PANEL_BUILD_TESTS)
     add_executable(capture_panel_tests
         tests/test_main.cpp
         tests/alignment_tests.cpp
+        tests/asio_buffer_timeline_tests.cpp
+        tests/asio_driver_registry_tests.cpp
+        tests/asio_sample_converter_tests.cpp
         tests/audio_tests.cpp
+        tests/backend_router_tests.cpp
         tests/capture_tests.cpp
         tests/channel_tests.cpp
         tests/cli_tests.cpp
@@ -80,11 +130,18 @@ if(CAPTURE_PANEL_BUILD_TESTS)
         tests/verification_tests.cpp
         tests/wav_tests.cpp
     )
-    target_include_directories(capture_panel_tests PRIVATE tests)
+    target_include_directories(capture_panel_tests
+        PRIVATE
+            tests
+            src/backends/asio/src
+            third_party/asio/common
+    )
     target_link_libraries(capture_panel_tests
         PRIVATE
             capture_panel_core
             capture_panel_fake
+            capture_panel_asio
+            capture_panel_backends
             capture_panel_cli_lib
     )
     capture_panel_enable_warnings(capture_panel_tests)

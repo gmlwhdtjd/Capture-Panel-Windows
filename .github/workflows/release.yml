@@ -1,0 +1,197 @@
+name: Release Windows App and CLI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_NOLOGO: "1"
+
+jobs:
+  release:
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Check out exact tag
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          global-json-file: global.json
+
+      - name: Build and test Release
+        shell: powershell
+        run: .\build.ps1 -Configuration Release -Test
+
+      - name: Verify version and package
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Release tags must use vX.Y.Z; received '$tag'"
+          }
+          $releaseVersion = $tag.Substring(1)
+          $exe = '.\out\build\windows-x64\bin\Release\capture-panel.exe'
+          $reported = (& $exe --version).Trim()
+          $expected = 'capture-panel ' + $releaseVersion
+          if ($reported -ne $expected) {
+            throw "Tag/version mismatch: tag '$tag', executable '$reported'"
+          }
+
+          $packageName = "capture-panel-windows-$tag"
+          $dist = Join-Path $PWD 'dist'
+          $stage = Join-Path $dist $packageName
+          $publish = Join-Path $PWD 'out\publish\windows-x64'
+          $uiProject = '.\src\ui\CapturePanel.App\CapturePanel.App.csproj'
+
+          $managedDeclared = (dotnet msbuild $uiProject `
+            -nologo -getProperty:Version).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not read the WPF project version'
+          }
+          if ($managedDeclared -ne $releaseVersion) {
+            throw "Tag/version mismatch: tag '$tag', WPF project '$managedDeclared'"
+          }
+
+          dotnet restore $uiProject `
+            --runtime win-x64 `
+            -p:SelfContained=true
+          if ($LASTEXITCODE -ne 0) {
+            throw 'WPF self-contained restore failed'
+          }
+
+          dotnet publish $uiProject `
+            --configuration Release `
+            --runtime win-x64 `
+            --self-contained true `
+            --no-restore `
+            --output $publish `
+            -p:Version=$releaseVersion `
+            -p:PublishTrimmed=false `
+            -p:PublishSingleFile=false
+          if ($LASTEXITCODE -ne 0) {
+            throw 'WPF publish failed'
+          }
+
+          $uiExecutable = Join-Path $publish 'CapturePanel.exe'
+          $uiAssembly = Join-Path $publish 'CapturePanel.dll'
+          if (-not (Test-Path -LiteralPath $uiExecutable) -or
+              -not (Test-Path -LiteralPath $uiAssembly)) {
+            throw 'WPF publish did not produce CapturePanel.exe and CapturePanel.dll'
+          }
+          $assemblyVersion = [System.Reflection.AssemblyName]::GetAssemblyName(
+            (Resolve-Path -LiteralPath $uiAssembly).Path).Version
+          $managedReported = '{0}.{1}.{2}' -f `
+            $assemblyVersion.Major, $assemblyVersion.Minor, $assemblyVersion.Build
+          if ($managedReported -ne $releaseVersion) {
+            throw "Tag/version mismatch: tag '$tag', WPF assembly '$managedReported'"
+          }
+
+          # The WPF process launches this executable as its isolated ASIO worker.
+          Copy-Item -LiteralPath $exe -Destination (Join-Path $publish 'capture-panel.exe') -Force
+
+          $deps = Get-Content -LiteralPath (Join-Path $publish 'CapturePanel.deps.json') `
+            -Raw | ConvertFrom-Json
+          $runtimeLibraries = @($deps.libraries.PSObject.Properties.Name)
+          $coreRuntimeLibrary = $runtimeLibraries |
+            Where-Object { $_ -like 'runtimepack.Microsoft.NETCore.App.Runtime.win-x64/*' } |
+            Select-Object -First 1
+          $desktopRuntimeLibrary = $runtimeLibraries |
+            Where-Object { $_ -like 'runtimepack.Microsoft.WindowsDesktop.App.Runtime.win-x64/*' } |
+            Select-Object -First 1
+          if (-not $coreRuntimeLibrary -or -not $desktopRuntimeLibrary) {
+            throw 'Could not identify the self-contained .NET runtime packs'
+          }
+          $coreRuntimeVersion = ($coreRuntimeLibrary -split '/', 2)[1]
+          $desktopRuntimeVersion = ($desktopRuntimeLibrary -split '/', 2)[1]
+          $nugetPackages = if ($env:NUGET_PACKAGES) {
+            $env:NUGET_PACKAGES
+          } else {
+            Join-Path ([Environment]::GetFolderPath('UserProfile')) '.nuget\packages'
+          }
+          $coreRuntimeLicenseRoot = Join-Path $nugetPackages `
+            "microsoft.netcore.app.runtime.win-x64\$coreRuntimeVersion"
+          $desktopRuntimeLicenseRoot = Join-Path $nugetPackages `
+            "microsoft.windowsdesktop.app.runtime.win-x64\$desktopRuntimeVersion"
+
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $stage 'licenses') -Force | Out-Null
+
+          Copy-Item -Path (Join-Path $publish '*') -Destination $stage -Recurse -Force
+          Copy-Item -LiteralPath '.\README.md' -Destination $stage -Force
+          Copy-Item -LiteralPath '.\LICENSE' -Destination $stage -Force
+          Copy-Item -LiteralPath '.\THIRD_PARTY_NOTICES.md' -Destination $stage -Force
+          Copy-Item -LiteralPath '.\Docs' -Destination $stage -Recurse -Force
+          Copy-Item -LiteralPath '.\third_party\asio\LICENSE.txt' `
+            -Destination (Join-Path $stage 'licenses\Steinberg-ASIO-SDK-LICENSE.txt') -Force
+          Copy-Item -LiteralPath (Join-Path $coreRuntimeLicenseRoot 'LICENSE.TXT') `
+            -Destination (Join-Path $stage 'licenses\dotnet-runtime-LICENSE.txt') -Force
+          Copy-Item -LiteralPath (Join-Path $coreRuntimeLicenseRoot 'THIRD-PARTY-NOTICES.TXT') `
+            -Destination (Join-Path $stage 'licenses\dotnet-runtime-THIRD-PARTY-NOTICES.txt') -Force
+          Copy-Item -LiteralPath (Join-Path $desktopRuntimeLicenseRoot 'LICENSE') `
+            -Destination (Join-Path $stage 'licenses\windows-desktop-runtime-LICENSE.txt') -Force
+
+          foreach ($requiredFile in @(
+              'CapturePanel.exe',
+              'capture-panel.exe',
+              'LICENSE',
+              'THIRD_PARTY_NOTICES.md',
+              'licenses\Steinberg-ASIO-SDK-LICENSE.txt',
+              'licenses\dotnet-runtime-LICENSE.txt',
+              'licenses\dotnet-runtime-THIRD-PARTY-NOTICES.txt',
+              'licenses\windows-desktop-runtime-LICENSE.txt')) {
+            if (-not (Test-Path -LiteralPath (Join-Path $stage $requiredFile))) {
+              throw "Release package is missing $requiredFile"
+            }
+          }
+
+          $binaryZip = Join-Path $dist "$packageName.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $binaryZip
+
+          $sourceZip = Join-Path $dist "$packageName-source.zip"
+          git archive --format=zip --prefix="$packageName-source/" `
+            --output="$sourceZip" HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw 'git archive failed'
+          }
+
+          $sumFile = Join-Path $dist 'SHA256SUMS'
+          Get-ChildItem -LiteralPath $dist -File |
+            Where-Object Name -ne 'SHA256SUMS' |
+            Sort-Object Name |
+            ForEach-Object {
+              $hash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $($_.Name)"
+            } | Set-Content -LiteralPath $sumFile -Encoding ascii
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: capture-panel-windows-${{ github.ref_name }}
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+      - name: Create GitHub release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = (Get-ChildItem -LiteralPath '.\dist' -File).FullName
+          gh release create $env:GITHUB_REF_NAME $assets `
+            --verify-tag `
+            --generate-notes `
+            --title "Capture Panel for Windows $env:GITHUB_REF_NAME"
+          if ($LASTEXITCODE -ne 0) {
+            throw 'GitHub release creation failed'
+          }

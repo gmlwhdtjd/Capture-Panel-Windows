@@ -64,6 +64,61 @@ CaptureConfiguration configuration_for(const TemporaryWavPair& files) {
     };
 }
 
+class PartialSampleRateFailureBackend final
+    : public IAudioDeviceProvider,
+      public IAudioCaptureBackend {
+public:
+    [[nodiscard]] std::vector<AudioDevice> devices() const override {
+        return {device("partial:sample-rate")};
+    }
+
+    [[nodiscard]] AudioDevice device(const std::string& id) const override {
+        validate_id(id);
+        return {
+            .id = "partial:sample-rate",
+            .name = "Partial sample-rate backend",
+            .input_channels = 1,
+            .output_channels = 1,
+            .sample_rate = sample_rate_,
+            .available = true,
+        };
+    }
+
+    [[nodiscard]] std::vector<AudioChannel> channels(
+        const std::string& id,
+        ChannelDirection) const override {
+        validate_id(id);
+        return {{.index = 1, .name = "Channel 1"}};
+    }
+
+    void set_sample_rate(const std::string& id, double sample_rate) override {
+        validate_id(id);
+        configured_rates.push_back(sample_rate);
+        sample_rate_ = sample_rate;
+        if (std::abs(sample_rate - 44'100.0) <= 0.5) {
+            throw CaptureError(
+                ErrorCode::backend_failure,
+                "The device changed rate before reporting failure.");
+        }
+    }
+
+    RawAudioCaptureResult capture(const RawAudioCaptureRequest&) override {
+        capture_called = true;
+        return {};
+    }
+
+    double sample_rate_ = 48'000.0;
+    std::vector<double> configured_rates;
+    bool capture_called = false;
+
+private:
+    static void validate_id(const std::string& id) {
+        if (id != "partial:sample-rate") {
+            throw CaptureError(ErrorCode::device_not_found, "Audio driver not found: " + id);
+        }
+    }
+};
+
 } // namespace
 
 CP_TEST_CASE("CaptureService runs the complete fake loopback capture pipeline") {
@@ -156,6 +211,72 @@ CP_TEST_CASE("CaptureService setup verification passes through the fake backend"
     CP_REQUIRE(result.failures.empty());
 }
 
+CP_TEST_CASE("CaptureService setup verification reports the input peak after input trim") {
+    auto backend = std::make_shared<capture_panel::fake::FakeAudioBackend>();
+    CaptureService service(backend, backend);
+
+    const auto result = service.verify_setup(
+        {
+            .driver_id = std::string(capture_panel::fake::loopback_device_id),
+            .playback_channels = {1},
+            .record_channels = {1},
+        },
+        std::nullopt,
+        0.0,
+        -6.0);
+
+    CP_REQUIRE(result.passed());
+    CP_REQUIRE_NEAR(result.output_peak_dbfs, -12.0, 0.05);
+    CP_REQUIRE_NEAR(result.input_peak_dbfs, -18.0, 0.05);
+}
+
+CP_TEST_CASE("CaptureService setup verification keeps raw clipping after negative input trim") {
+    auto backend = std::make_shared<capture_panel::fake::FakeAudioBackend>(
+        capture_panel::fake::FakeBackendOptions{
+            .loopback_gain_db = 20.0 * std::log10(4.0),
+        });
+    CaptureService service(backend, backend);
+
+    const auto result = service.verify_setup(
+        {
+            .driver_id = std::string(capture_panel::fake::loopback_device_id),
+            .playback_channels = {1},
+            .record_channels = {1},
+        },
+        std::nullopt,
+        0.0,
+        -12.0);
+
+    CP_REQUIRE(!result.passed());
+    CP_REQUIRE_NEAR(result.input_peak_dbfs, -12.0, 0.05);
+    CP_REQUIRE(std::find(
+        result.failures.begin(),
+        result.failures.end(),
+        CaptureFailure::digital_clipping) != result.failures.end());
+}
+
+CP_TEST_CASE("CaptureService setup verification detects clipping introduced by positive input trim") {
+    auto backend = std::make_shared<capture_panel::fake::FakeAudioBackend>();
+    CaptureService service(backend, backend);
+
+    const auto result = service.verify_setup(
+        {
+            .driver_id = std::string(capture_panel::fake::loopback_device_id),
+            .playback_channels = {1},
+            .record_channels = {1},
+        },
+        std::nullopt,
+        0.0,
+        12.0);
+
+    CP_REQUIRE(!result.passed());
+    CP_REQUIRE_NEAR(result.input_peak_dbfs, 0.0, 0.05);
+    CP_REQUIRE(std::find(
+        result.failures.begin(),
+        result.failures.end(),
+        CaptureFailure::digital_clipping) != result.failures.end());
+}
+
 CP_TEST_CASE("CaptureService propagates cancellation from the fake backend") {
     TemporaryWavPair files("capture-panel-cancelled");
     write_wav(files.input, sine_source(48'000.0, 1'000), AudioBitDepth::pcm24);
@@ -173,4 +294,55 @@ CP_TEST_CASE("CaptureService propagates cancellation from the fake backend") {
     }
     CP_REQUIRE(cancelled);
     CP_REQUIRE(!std::filesystem::exists(files.output));
+}
+
+CP_TEST_CASE("CaptureService restores a partially changed rate when configuration fails") {
+    TemporaryWavPair files("capture-panel-partial-rate-failure");
+    write_wav(files.input, sine_source(44'100.0, 441), AudioBitDepth::pcm24);
+
+    auto backend = std::make_shared<PartialSampleRateFailureBackend>();
+    CaptureService service(backend, backend);
+    bool failed = false;
+    try {
+        static_cast<void>(service.capture({
+            .input_path = files.input,
+            .output_path = files.output,
+            .route = {
+                .driver_id = "partial:sample-rate",
+                .playback_channels = {1},
+                .record_channels = {1},
+            },
+        }));
+    } catch (const CaptureError& error) {
+        failed = error.code() == ErrorCode::backend_failure;
+    }
+
+    CP_REQUIRE(failed);
+    CP_REQUIRE(!backend->capture_called);
+    CP_REQUIRE(backend->configured_rates.size() == 2);
+    CP_REQUIRE_NEAR(backend->configured_rates[0], 44'100.0, 0.01);
+    CP_REQUIRE_NEAR(backend->configured_rates[1], 48'000.0, 0.01);
+    CP_REQUIRE_NEAR(backend->sample_rate_, 48'000.0, 0.01);
+}
+
+CP_TEST_CASE("CaptureService setup verification restores rate after configuration failure") {
+    auto backend = std::make_shared<PartialSampleRateFailureBackend>();
+    CaptureService service(backend, backend);
+    bool failed = false;
+    try {
+        static_cast<void>(service.verify_setup(
+            {
+                .driver_id = "partial:sample-rate",
+                .playback_channels = {1},
+                .record_channels = {1},
+            },
+            44'100.0));
+    } catch (const CaptureError& error) {
+        failed = error.code() == ErrorCode::backend_failure;
+    }
+
+    CP_REQUIRE(failed);
+    CP_REQUIRE(!backend->capture_called);
+    CP_REQUIRE(backend->configured_rates.size() == 2);
+    CP_REQUIRE_NEAR(backend->sample_rate_, 48'000.0, 0.01);
 }

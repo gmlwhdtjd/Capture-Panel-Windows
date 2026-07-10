@@ -65,6 +65,29 @@ CP_TEST_CASE("verification accepts a sweep at the expected aligned timing") {
     CP_REQUIRE(result.warnings.empty());
 }
 
+CP_TEST_CASE("verification uses recorded channel count when playback and recording differ") {
+    const auto signal = make_verification_signal(10'000.0, 2);
+    AudioBuffer mono_recording{
+        .sample_rate = signal.audio.sample_rate,
+        .channel_count = 1,
+        .samples = std::vector<float>(
+            static_cast<std::size_t>(signal.audio.frame_count()),
+            0.0F),
+    };
+    for (std::int64_t frame = 0; frame < signal.audio.frame_count(); ++frame) {
+        mono_recording.samples[static_cast<std::size_t>(frame)] =
+            signal.audio.samples[static_cast<std::size_t>(frame) * signal.audio.channel_count];
+    }
+
+    const auto result = evaluate_verification(
+        mono_recording, signal, empty_alignment_info(), -12.0);
+
+    CP_REQUIRE(result.failures.empty());
+    CP_REQUIRE(result.start_offset_frames == 0);
+    CP_REQUIRE(result.sweep.has_value());
+    CP_REQUIRE(result.sweep->direct_score > 0.99);
+}
+
 CP_TEST_CASE("verification reports equipment decay in the leading silence") {
     const auto signal = make_verification_signal(10'000.0, 1);
     auto aligned = signal.audio;

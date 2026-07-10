@@ -1,183 +1,137 @@
 # Capture Panel Windows Architecture
 
-## Status
-
-- Decision date: 2026-07-10
-- Product license: GPL-3.0-only, with complete corresponding source distributed with releases
-- Current milestone: platform-independent core and CLI running on a Fake audio backend
-- Deferred milestone: Steinberg ASIO backend
-- Deferred milestone: .NET 10 WPF application
-
-## Technology decisions
+## Decisions
 
 | Area | Decision |
 |---|---|
 | Audio domain and real-time code | C++20 |
-| Native build | CMake 4.2+ and `CMakePresets.json` |
-| Native compiler | Visual Studio 2026 / MSVC v145 |
-| Native tests | CTest with a dependency-free test harness during the core port |
-| Windows audio | `IAudioCaptureBackend`, implemented by Fake now and ASIO later |
-| CLI | Native C++ executable linked directly to the core |
-| GUI | C# WPF on .NET 10 LTS after the native API stabilizes |
-| GUI bridge | Thin C ABI DLL; no C++ ABI or audio buffer crosses into managed code |
+| Native build | CMake 4.2+ and checked-in presets |
+| Compiler | Visual Studio 2026 / MSVC v145, x64 |
+| Native tests | CTest with a dependency-free test harness |
+| Windows audio | native ASIO backend behind core interfaces |
+| Offline development/CI | deterministic Fake full-duplex backend |
+| CLI | native C++ executable linked directly to the core |
+| GUI | C# WPF on .NET 10, x64 |
+| GUI boundary | short-lived native CLI worker using versioned JSON Lines |
 | Local orchestration | `build.ps1`; mise is not required |
-| CI | GitHub Actions `windows-2025-vs2026` hosted runner; self-hosted only for hardware tests |
+| CI | hosted Windows builds; manual/protected physical audio tests |
+| License | GPL-3.0-only with corresponding source and notices |
 
 ## Target graph
 
 ```text
-capture_panel_core (static C++ library)
-  ├─ audio buffers, levels, WAV
-  ├─ capture orchestration
-  ├─ marker alignment
-  └─ setup verification
-          ↑
-IAudioDeviceProvider + IAudioCaptureBackend
-  ├─ FakeAudioBackend                current
-  └─ AsioAudioBackend                deferred
+capture_panel_core
+  |-- WAV, levels, capture orchestration
+  |-- marker alignment and setup verification
+  +-- IAudioDeviceProvider + IAudioCaptureBackend
+          |
+          +-- FakeAudioBackend
+          +-- AsioAudioBackend
+                    |-- 64-bit registry discovery
+                    |-- COM driver session + hidden HWND
+                    |-- PCM sample conversion
+                    +-- allocation-free double-buffer callback
 
-capture-panel.exe ───────────────→ core + selected backend
+BackendRouter
+  +-- combines Fake and ASIO identities for the CLI
 
-CapturePanel.exe (WPF)             deferred
-  → capture_panel_native.dll
-    → core + ASIO backend
+capture-panel.exe
+  +-- core + BackendRouter
+
+CapturePanel.exe (WPF)
+  +-- capture-panel.exe (one isolated worker process per operation)
+          +-- JSON protocol + CLI command layer
+          +-- core + BackendRouter + ASIO backend
 ```
 
-The `core` target cannot include Windows, ASIO, WPF, or .NET types. Audio inside the core is normalized interleaved float32.
+The core never includes Windows, ASIO, WPF, or .NET types. Core audio is
+normalized interleaved float32. The ASIO boundary converts it to and from the
+native channel-planar driver format.
 
 ## Repository layout
 
 ```text
 Capture-Panel-Windows/
-├─ CMakeLists.txt
-├─ CMakePresets.json
-├─ build.ps1
-├─ global.json                      reserved for the WPF milestone
-├─ Docs/
-├─ src/
-│  ├─ core/
-│  │  ├─ include/capture_panel/core/
-│  │  └─ src/
-│  ├─ backends/
-│  │  ├─ fake/
-│  │  └─ asio/                       deferred
-│  ├─ cli/
-│  ├─ native_api/                    deferred
-│  └─ app/                           deferred WPF project
-└─ tests/
+|-- CMakeLists.txt
+|-- CMakePresets.json
+|-- build.ps1
+|-- Docs/
+|-- src/
+|   |-- core/
+|   |-- backends/
+|   |   |-- fake/
+|   |   |-- asio/
+|   |   +-- router/
+|   |-- cli/
+|   +-- ui/CapturePanel.App/
+|-- tests/
+|   +-- ui/
+|-- third_party/asio/
+|-- LICENSE
++-- THIRD_PARTY_NOTICES.md
 ```
 
 ## Backend contract
 
-The core uses two narrow ports.
+`IAudioDeviceProvider` lists devices/channels and changes sample rate.
+`IAudioCaptureBackend` performs a synchronous full-duplex capture from a
+prepared playback buffer. The result is a recorded float buffer and the number
+of pre-padding frames.
+
+ASIO driver IDs use `asio:{CANONICAL-CLSID}`. Fake uses `fake:loopback`.
+No ASIO buffer, sample type, COM object, or clock type crosses the core
+boundary.
+
+One ASIO driver supplies both input and output for a pass. The first release
+does not combine unrelated drivers, open a driver control panel, or silently
+restart a pass after reset/resync/rate-change/overload events.
+
+## ASIO threading and lifetime
+
+A capture owns one STA COM apartment, one hidden top-level host window, and one
+`IASIO` instance on the same control thread. Lifecycle is:
 
 ```text
-IAudioDeviceProvider
-  devices
-  device
-  channels
-  set_sample_rate
-
-IAudioCaptureBackend
-  capture(RawAudioCaptureRequest) -> RawAudioCaptureResult
+CoInitializeEx(STA) -> hidden HWND -> CoCreateInstance -> init
+  -> rate/channel/buffer negotiation -> createBuffers -> start
+  -> control-thread wait/message pump
+  -> stop -> disposeBuffers -> Release -> DestroyWindow -> CoUninitialize
 ```
 
-`RawAudioCaptureRequest` contains the selected route, prepared playback audio, pre/post padding, cancellation token, and progress callback. The result contains the full recorded float buffer and the number of pre-pad frames.
+The driver callback performs only bounded sample copies/conversion and atomic
+state publication. It does not allocate, lock, log, perform file I/O, invoke
+progress handlers, or touch managed code. Progress, cancellation, timeouts, and
+driver event decisions run on the control thread.
 
-The Fake and ASIO implementations must obey the same observable contract. No ASIO-specific clock, buffer, driver, or sample type is visible above this boundary.
-
-## Fake backend policy
-
-The Fake backend is not a stub that merely returns success. It simulates a deterministic full-duplex loopback device so the complete product pipeline can run without hardware.
-
-- One driver named `fake:loopback`
-- Eight inputs and eight outputs
-- Default sample rate 48 kHz
-- Configurable round-trip latency and gain
-- Pre-pad and post-pad recording
-- Playback-to-record channel mapping
-- Progress and cancellation
-- Sample-rate changes exposed through the same device provider contract
-
-The Fake backend must support these end-to-end operations:
-
-```text
-WAV input
-→ validation
-→ marker/payload playback plan
-→ fake loopback capture
-→ marker alignment
-→ setup verification
-→ aligned WAV output
-```
-
-This gives CI meaningful coverage before the ASIO implementation exists.
+Because ASIO callbacks carry no user-data pointer, the process permits one
+active ASIO capture. Public channel numbers are one-based while
+`ASIOBufferInfo.channelNum` is zero-based.
 
 ## WPF boundary
 
-The future WPF application calls a native C ABI with opaque handles, UTF-8 strings, explicit memory ownership, and numeric error codes.
+The managed layer is control-plane only. It starts `capture-panel.exe` with
+`--json`, reads one UTF-8 `capture-panel/1` JSON object per stdout line, and
+terminates the worker to cancel or contain an unresponsive operation. Device
+metadata, progress, diagnostics, and final results cross the process boundary;
+audio samples and driver callbacks remain in the native worker.
 
-The managed layer may perform only control-plane operations:
+The Test result's `inputPeakDbfs` is the peak after input trim, matching the
+level shown by the desktop application. `digital_clipping` is evaluated against
+both the raw recorded peak and the adjusted peak; consumers must use that
+diagnostic rather than infer clipping from `inputPeakDbfs` alone.
 
-- enumerate devices and channels
-- update capture configuration
-- start and cancel a pass
-- poll progress and peak snapshots
-- read results and error text
-
-ASIO callbacks, playback samples, recorded samples, alignment, and verification remain entirely native. UI state is polled or dispatched at a non-real-time interval; a managed callback is never called from the ASIO real-time thread.
-
-## Build and test
-
-```powershell
-.\build.ps1 -Configuration Debug -Test
-.\build.ps1 -Configuration Release -Test
-```
-
-The underlying commands are:
-
-```powershell
-cmake --preset windows-x64
-cmake --build --preset windows-debug
-ctest --preset windows-debug
-```
-
-Generated build trees live under `out/` and are not committed.
+ASIO drivers are in-process COM servers. Keeping each operation in a short-lived
+worker prevents a vendor driver access violation from taking down the WPF
+process and preserves the ASIO STA/hidden-window lifecycle already used by the
+CLI. `capture-panel.exe` is therefore a required application file, not an
+optional developer tool.
 
 ## CI and release
 
-Hosted GitHub Actions jobs can build and test all source in the current milestone. They cannot prove physical routing or ASIO driver behavior.
-
-`.github/workflows/ci.yml` runs the Fake-backed test suite in both Debug and
-Release on every pull request and main-branch push.
-
-```text
-Pull request / main push
-  → configure CMake
-  → build Debug/Release
-  → run core, Fake backend, and CLI tests
-
-v* tag
-  → Release build and tests
-  → publish WPF app when available
-  → bundle native DLLs, licenses, notices, and exact corresponding source
-  → generate SHA-256
-  → create GitHub Release
-
-Manual hardware job
-  → self-hosted Windows runner with the target ASIO device
-```
-
-If the ASIO SDK is stored as a Git submodule, release automation must create its own source bundle because GitHub's automatic source archive does not include submodule contents.
-
-## License release gate
-
-Before the first distributed binary:
-
-- add the exact GPLv3 license variant used by the downloaded ASIO SDK
-- preserve Steinberg notices and ASIO trademark guidance
-- add `THIRD_PARTY_NOTICES.md`
-- include complete source, build scripts, SDK source, and modifications for the exact binary
-- expose license/source information in the CLI and later in the WPF settings page
-
-No ASIO SDK source is added until its exact downloaded license text and version are recorded.
+Hosted CI builds Debug and Release native targets first, then the .NET 10 WPF
+application and managed tests. Release publishing creates a self-contained
+`win-x64` WPF folder, places the native worker beside the GUI executable, and
+packages both with licenses, documentation, and corresponding source. CI does
+not open an ASIO driver. Physical routing remains a manual or protected
+self-hosted gate because hosted runners have neither the vendor driver nor the
+device.

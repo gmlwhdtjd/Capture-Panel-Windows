@@ -177,7 +177,7 @@ void write_log_sweep(
     const VerificationSignal& signal) {
     const auto recorded = mono_samples(
         aligned.samples,
-        signal.channel_count,
+        aligned.channel_count,
         AudioFrameRange{.lower_bound = 0, .upper_bound = aligned_frame_count});
     const auto reference = mono_samples(
         signal.audio.samples,
@@ -361,11 +361,11 @@ void write_log_sweep(
     }
     const auto leading_peak = peak(
         aligned.samples,
-        signal.channel_count,
+        aligned.channel_count,
         signal.leading_silence_frame_range);
     const auto leading_rms = rms(
         aligned.samples,
-        signal.channel_count,
+        aligned.channel_count,
         signal.leading_silence_frame_range);
     return leading_peak > first_event_peak * linear_from_dbfs(
                constants::verification_evaluation::leading_silence_peak_relative_dbfs)
@@ -452,9 +452,8 @@ AlignmentVerificationResult evaluate_verification(
     const PayloadAlignmentInfo& alignment_info,
     double input_peak_dbfs) {
     static_cast<void>(alignment_info);
-    const auto channel_count = std::max<std::uint32_t>(1, signal.channel_count);
-    const auto aligned_frame_count = static_cast<Frame>(
-        aligned.samples.size() / static_cast<std::size_t>(channel_count));
+    const auto channel_count = aligned.channel_count;
+    const auto aligned_frame_count = aligned.frame_count();
     std::vector<CaptureWarning> warnings;
     std::vector<CaptureFailure> failures;
 

@@ -1,91 +1,86 @@
-# Core and CLI Port Status
+# Core, CLI, ASIO, and WPF Port Status
 
 ## Scope
 
 This status tracks the Windows port of the platform-independent behavior in
-`Capture-Panel-Mac` at commit `8499e22eb7689748c610075606606790114c1e34`.
-The WPF UI and the physical ASIO transport are intentionally outside this
-milestone.
+`Capture-Panel-Mac` at commit `3b4537ef7abe21f641c4ada84712a4f28836353c`,
+plus the native Windows ASIO transport and .NET 10 WPF application.
 
 ## Implemented
 
-| Area | Windows implementation | Automated coverage |
+| Area | Windows implementation | Verification |
 |---|---|---|
-| Audio model | normalized interleaved float32, peak/RMS, dB gain, frame extraction | unit tests |
-| WAV | RIFF parsing, PCM 16/24/32, float32, extensible format, PCM writing | fixture and round-trip tests |
-| Channels | one-based lists and ranges, device-bound validation | parser and failure tests |
-| Playback plan | five markers, marker spacing, marker-to-payload silence | algorithm tests |
-| Alignment | adaptive marker detection, sequence fitting, latency, trim, zero padding | ported edge-case tests |
-| Setup verification | log sweep, correlation, timing, ambiguity, clipping, missing signal, decay | ported edge-case tests |
-| Capture orchestration | validation, sample-rate restore, progress, cancellation, events, aligned output | Fake end-to-end tests |
-| Backend boundary | device provider and raw full-duplex capture interfaces | Fake contract tests |
-| Fake backend | deterministic 8x8 loopback, latency, gain, padding, progress, cancellation | unit and end-to-end tests |
-| CLI | `devices`, `channels`, `test`, `run`, help, version, license | parser, diagnostics, UTF-8 path, end-to-end tests |
+| Audio model | normalized interleaved float32, levels, gain, frame extraction | unit tests |
+| WAV | PCM 16/24/32, float32/extensible input, PCM output | round-trip and fixture tests |
+| Channels | one-based lists/ranges and device-bound validation | parser and failure tests |
+| Alignment | five-marker plan, sequence fit, latency trim, zero padding | ported edge cases |
+| Setup verification | log sweep, timing, ambiguity, pre/post-trim clipping, missing signal, decay | ported edge cases |
+| Capture orchestration | rate restore, progress, cancellation, events, output | Fake end-to-end tests |
+| Fake backend | deterministic 8x8 full-duplex loopback | unit and CLI tests |
+| Backend router | combined Fake and ASIO discovery/delegation | unit tests |
+| ASIO discovery | 64-bit registry, canonical CLSID IDs, availability probing | pure helper tests + local smoke |
+| ASIO formats | Int16/24/32, Float32/64, Int32 16/18/20/24 containers, LSB/MSB | conversion tests |
+| ASIO streaming | COM/hidden HWND lifecycle, selected buffers, RT callback, timeout/cancel/reset/resync/overload handling | buffer-timeline tests + three Anagram passes |
+| CLI | `devices`, `channels`, `test`, `run`, help/version/license | parser and end-to-end tests |
+| Worker protocol | versioned UTF-8 JSON Lines for devices/channels/test/run/events/errors | native CLI JSON tests + managed parser use |
+| WPF desktop | source/route selection, setup gate, capture/cancel/progress, local settings, About/license window | dependency-free managed tests |
+| Licensing | SDK 2.3.4 headers, SDK license, notices, GPL release requirements | repository audit |
 
-The test executable currently contains 55 deterministic tests and does not
-require an audio driver or physical device.
+The deterministic native and managed UI test executables require neither an
+audio driver nor a physical device. Their current totals are reported by each
+test runner during the build instead of being duplicated here.
 
-## Intentional Windows differences
+## Windows-specific behavior
 
-- ASIO exposes inputs and outputs through one selected driver, so Windows uses
-  one string `--driver` instead of separate Core Audio playback and recording
-  device IDs.
-- The first Windows release does not combine two unrelated ASIO drivers.
-- macOS aggregate-device creation, `--clock-source`, and drift-compensation
-  selection are Core Audio-specific and are not part of the Windows contract.
-- Public channel numbers remain one-based. A backend translates them to its
-  native zero-based representation.
-
-## Deferred to the ASIO milestone
-
-- driver discovery, load/unload, and driver-specific diagnostics
-- ASIO buffer-size and sample-type negotiation
-- native ASIO sample conversion
-- real-time double-buffer callbacks and preallocated transfer buffers
-- timeout, reset, resync, and device-disconnect behavior
-- measured latency and physical loopback validation
-- ASIO SDK source/notice packaging and `THIRD_PARTY_NOTICES.md`
-
-The core and CLI do not need to change shape for this work. The executable will
-replace the injected `FakeAudioBackend` with an ASIO implementation of the same
-two interfaces.
-
-## Fake CLI smoke flow
-
-```powershell
-capture-panel devices
-capture-panel channels fake:loopback
-capture-panel test `
-  --driver fake:loopback `
-  --play-channel 1 `
-  --record-channel 1 `
-  --verbose
-capture-panel run `
-  --input source.wav `
-  --output recorded.wav `
-  --driver fake:loopback `
-  --play-channel 1 `
-  --record-channel 1
-```
+- A route uses one ASIO driver ID because ASIO exposes its inputs and outputs as
+  one synchronous device.
+- The first release does not combine unrelated ASIO drivers.
+- Core Audio aggregate-device, clock-source, and drift-compensation controls do
+  not map directly to this Windows contract.
+- Public channels are one-based. ASIO `channelNum` is zero-based internally.
+- Duplicate physical channels in one ASIO route are rejected because one driver
+  buffer cannot represent two independent logical mappings safely.
+- Setup Test reports `inputPeakDbfs` after input trim. Clipping evaluates the
+  higher of the pre-trim and post-trim peaks, so attenuation cannot hide ADC/raw
+  clipping and positive gain cannot introduce clipping unnoticed.
 
 ## Verification record
 
-- Date: 2026-07-10
-- Visual Studio Community 2026 18.7.3
-- MSVC 19.51.36248 / v145 toolset
+Date: 2026-07-11
+
+- Visual Studio Community 2026 18.7.3/18.7.8 build tools
+- MSVC 19.51 / v145 toolset
 - CMake 4.3.1 and Windows SDK 10.0.26100.0
-- Debug: build passed; 55/55 tests passed
-- Release: build passed; 55/55 tests passed
-- CLI smoke: default device list, channel list, verbose setup verification,
-  version, and license commands passed on `fake:loopback`
+- Debug build: passed
+- Debug deterministic tests: passed
+- CLI registry smoke: Realtek ASIO probed and its 2 inputs/2 outputs listed
+- CLI Fake setup verification: passed at -36 dBFS peak
+- Darkglass ASIO discovery: 3 inputs, 9 outputs, 48 kHz
+- Anagram output 9 -> input 1: three Debug and four Release passes at -36 dBFS
+  (312-348 frames / 6.50-7.25 ms, timing error 0, warnings/failures 0)
+- Release build and deterministic tests: passed
+- WPF Debug/Release builds: passed
+- Managed UI test suite: passed
 
-Hosted CI is defined in `.github/workflows/ci.yml` and repeats Debug and Release
-validation on `windows-2025-vs2026`. Physical ASIO validation remains a manual or
-self-hosted hardware job.
+Release validation is repeated before handoff. Hosted CI builds and tests the
+same deterministic suite. It cannot validate a vendor driver, callback timing,
+or a physical cable.
 
-## License
+## Hardware gate
 
-Capture Panel for Windows is released under GPL-3.0-only. The repository
-contains the official license text in `LICENSE`. Binary release automation must
-ship that file, the exact corresponding source, build scripts, and all required
-ASIO notices and source once the ASIO backend is added.
+The target Anagram output 9 to input 1 path passed seven times using the official
+Darkglass USB Audio 5.72.0 driver. Details and safe reproduction steps are in
+[HARDWARE_TESTING.md](HARDWARE_TESTING.md). Disconnect/reset/overload injection
+and long-duration soak testing remain separate robustness gates.
+
+## Remaining product milestones
+
+- add disconnect/reset/overload injection and long-duration hardware tests
+- add full UI Automation, keyboard, screen-reader, and 200 percent scaling tests
+- add installer/code-signing support after the portable ZIP release
+
+## License release gate
+
+Every binary release must include the GPLv3 license, third-party notices, the
+Steinberg SDK license, and exact corresponding source/build scripts. Hardware
+vendor ASIO drivers are never included.

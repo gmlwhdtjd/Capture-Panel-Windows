@@ -1,5 +1,8 @@
 /out/
 /build/
+/dist/
+**/[Bb]in/
+**/[Oo]bj/
 /.vs/
 /vcpkg_installed/
 /CMakeUserPresets.json

@@ -42,6 +42,11 @@ struct PassExecution {
     std::chrono::duration<double> elapsed{};
 };
 
+struct InputPeakLevels {
+    double adjusted_dbfs;
+    double clipping_dbfs;
+};
+
 [[nodiscard]] double finite_or_zero(double value) noexcept {
     return std::isfinite(value) ? value : 0.0;
 }
@@ -50,6 +55,21 @@ struct PassExecution {
     return {
         .playback_gain_db = finite_or_zero(options.playback_gain_db),
         .recording_gain_db = finite_or_zero(options.recording_gain_db),
+    };
+}
+
+[[nodiscard]] InputPeakLevels input_peak_levels(
+    const std::span<const float> recorded_samples,
+    const double recording_gain_db) noexcept {
+    const auto raw_peak = peak(recorded_samples);
+    auto recording_gain = linear_from_dbfs(recording_gain_db);
+    if (!std::isfinite(recording_gain)) recording_gain = 1.0;
+
+    const auto raw_dbfs = dbfs_from_peak(raw_peak);
+    const auto adjusted_dbfs = dbfs_from_peak(raw_peak * recording_gain);
+    return {
+        .adjusted_dbfs = adjusted_dbfs,
+        .clipping_dbfs = std::max(raw_dbfs, adjusted_dbfs),
     };
 }
 
@@ -221,13 +241,13 @@ CapturePassResult CaptureService::capture(
         .stage = CaptureStage::sample_rate_configuration,
         .sample_rate = source.input.format.sample_rate,
     });
-    device_provider_->set_sample_rate(
-        source.validated_route.device.id,
-        source.input.format.sample_rate);
     SampleRateRestore restore(
         *device_provider_,
         source.validated_route.device.id,
         source.validated_route.device.sample_rate,
+        source.input.format.sample_rate);
+    device_provider_->set_sample_rate(
+        source.validated_route.device.id,
         source.input.format.sample_rate);
 
     const auto playback_gain = static_cast<float>(linear_from_dbfs(options.playback_gain_db));
@@ -370,12 +390,12 @@ CaptureVerificationResult CaptureService::verify_setup(
         .stage = CaptureStage::sample_rate_configuration,
         .sample_rate = sample_rate,
     });
-    device_provider_->set_sample_rate(validated.device.id, sample_rate);
     SampleRateRestore restore(
         *device_provider_,
         validated.device.id,
         validated.device.sample_rate,
         sample_rate);
+    device_provider_->set_sample_rate(validated.device.id, sample_rate);
 
     const auto playback_gain = static_cast<float>(linear_from_dbfs(options.playback_gain_db));
     const auto plan = make_alignment_playback_plan(signal.audio, playback_gain);
@@ -411,7 +431,9 @@ CaptureVerificationResult CaptureService::verify_setup(
         .elapsed_seconds = std::chrono::duration<double>(elapsed).count(),
     });
 
-    const auto raw_input_peak_dbfs = dbfs_from_peak(peak(raw.recorded.samples));
+    const auto input_peaks = input_peak_levels(
+        raw.recorded.samples,
+        options.recording_gain_db);
     emit({.type = CaptureEventType::stage_changed, .stage = CaptureStage::alignment});
     apply_gain_db(raw.recorded.samples, options.recording_gain_db);
     auto alignment = align_payload(raw.recorded, {
@@ -446,7 +468,7 @@ CaptureVerificationResult CaptureService::verify_setup(
         alignment.audio,
         signal,
         alignment.info,
-        raw_input_peak_dbfs);
+        input_peaks.clipping_dbfs);
     for (const auto warning : verification.warnings) {
         emit({
             .type = CaptureEventType::warning,
@@ -474,7 +496,7 @@ CaptureVerificationResult CaptureService::verify_setup(
         .verification = std::move(verification),
         .impulse_detection = std::move(alignment.impulse_detection),
         .output_peak_dbfs = dbfs_from_peak(std::max(marker_peak, payload_peak)),
-        .input_peak_dbfs = raw_input_peak_dbfs,
+        .input_peak_dbfs = input_peaks.adjusted_dbfs,
         .sample_rate = sample_rate,
         .warnings = std::move(warnings),
         .failures = std::move(failures),
