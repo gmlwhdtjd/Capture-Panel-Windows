@@ -397,6 +397,80 @@ CP_TEST_CASE("CLI parses test routing and positional channels driver") {
     CP_REQUIRE(output_devices.outputs_only);
 }
 
+CP_TEST_CASE("CLI accepts trim boundaries and rejects values outside them") {
+    const auto minimums = cli::parse_arguments({
+        "test",
+        "--driver", "fake:loopback",
+        "--play-channel", "1",
+        "--record-channel", "1",
+        "--output-trim", "-24",
+        "--input-trim", "-18",
+    });
+    CP_REQUIRE_NEAR(minimums.output_trim_db, -24.0, 0.000001);
+    CP_REQUIRE_NEAR(minimums.input_trim_db, -18.0, 0.000001);
+
+    const auto maximums = cli::parse_arguments({
+        "test",
+        "--driver", "fake:loopback",
+        "--play-channel", "1",
+        "--record-channel", "1",
+        "--output-trim", "0",
+        "--input-trim", "12",
+    });
+    CP_REQUIRE_NEAR(maximums.output_trim_db, 0.0, 0.000001);
+    CP_REQUIRE_NEAR(maximums.input_trim_db, 12.0, 0.000001);
+
+    for (const auto& [option, value] : std::vector<std::pair<std::string, std::string>>{
+             {"--output-trim", "-24.0001"},
+             {"--output-trim", "0.0001"},
+             {"--input-trim", "-18.0001"},
+             {"--input-trim", "12.0001"},
+         }) {
+        auto rejected = false;
+        try {
+            (void)cli::parse_arguments({
+                "test",
+                "--driver", "fake:loopback",
+                "--play-channel", "1",
+                "--record-channel", "1",
+                option, value,
+            });
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        CP_REQUIRE(rejected);
+    }
+}
+
+CP_TEST_CASE("CLI accepts only the documented setup sample-rate range") {
+    for (const auto& value : {std::string("1000"), std::string("768000")}) {
+        const auto parsed = cli::parse_arguments({
+            "test",
+            "--driver", "fake:loopback",
+            "--play-channel", "1",
+            "--record-channel", "1",
+            "--sample-rate", value,
+        });
+        CP_REQUIRE(parsed.sample_rate.has_value());
+    }
+
+    for (const auto& value : {std::string("999.9"), std::string("768000.1")}) {
+        auto rejected = false;
+        try {
+            static_cast<void>(cli::parse_arguments({
+                "test",
+                "--driver", "fake:loopback",
+                "--play-channel", "1",
+                "--record-channel", "1",
+                "--sample-rate", value,
+            }));
+        } catch (const std::invalid_argument&) {
+            rejected = true;
+        }
+        CP_REQUIRE(rejected);
+    }
+}
+
 CP_TEST_CASE("CLI rejects malformed or incomplete run options") {
     bool malformed_range = false;
     try {
@@ -738,6 +812,13 @@ CP_TEST_CASE("CLI help version license and usage errors do not require audio ser
 
     CP_REQUIRE(cli::run_cli({"help", "run"}, no_dependencies, output, error) == 0);
     CP_REQUIRE(output.str().find("--bit-depth") != std::string::npos);
+    CP_REQUIRE(output.str().find("--output-trim <-24..0>") != std::string::npos);
+    CP_REQUIRE(output.str().find("--input-trim <-18..12>") != std::string::npos);
+
+    output.str("");
+    output.clear();
+    CP_REQUIRE(cli::run_cli({"help", "test"}, no_dependencies, output, error) == 0);
+    CP_REQUIRE(output.str().find("--sample-rate <1000..768000>") != std::string::npos);
 
     output.str("");
     output.clear();
@@ -818,9 +899,11 @@ CP_TEST_CASE("CLI JSON mode frames usage runtime and malformed-option errors") {
         },
         fake_dependencies,
         consumed_output,
-        consumed_error) == 1);
+        consumed_error) == 2);
     CP_REQUIRE(consumed_error.str().empty());
     CP_REQUIRE(valid_protocol_jsonl(consumed_output.str()));
+    CP_REQUIRE(consumed_output.str().find("\"category\":\"usage\"") != std::string::npos);
+    CP_REQUIRE(consumed_output.str().find("--driver requires a value") != std::string::npos);
     CP_REQUIRE(consumed_output.str().find("Testing route\n") == std::string::npos);
 
     auto invalid_startup_message = std::string("startup \"failure\": ");
@@ -840,6 +923,64 @@ CP_TEST_CASE("CLI JSON mode frames usage runtime and malformed-option errors") {
         != std::string::npos);
     CP_REQUIRE(startup_output.str().find("\\\"failure\\\"") != std::string::npos);
     CP_REQUIRE(startup_output.str().find("\\uFFFD") != std::string::npos);
+}
+
+CP_TEST_CASE("CLI JSON reports trim range violations before configuring audio") {
+    const cli::Dependencies no_dependencies;
+    for (const auto& [option, value] : std::vector<std::pair<std::string, std::string>>{
+             {"--output-trim", "1000"},
+             {"--input-trim", "1000"},
+         }) {
+        std::ostringstream output;
+        std::ostringstream error;
+        const auto exit_code = cli::run_cli(
+            {
+                "test",
+                "--driver", "fake:loopback",
+                "--play-channel", "1",
+                "--record-channel", "1",
+                option, value,
+                "--json",
+            },
+            no_dependencies,
+            output,
+            error);
+
+        CP_REQUIRE(exit_code == 2);
+        CP_REQUIRE(error.str().empty());
+        CP_REQUIRE(valid_protocol_jsonl(output.str()));
+        CP_REQUIRE(non_empty_lines(output.str()).size() == 1);
+        CP_REQUIRE(output.str().find("\"category\":\"usage\"") != std::string::npos);
+        CP_REQUIRE(output.str().find(option) != std::string::npos);
+    }
+}
+
+CP_TEST_CASE("CLI JSON rejects sample rates outside the documented range") {
+    std::ostringstream output;
+    std::ostringstream error;
+
+    const auto exit_code = cli::run_cli(
+        {
+            "test",
+            "--driver", "fake:loopback",
+            "--play-channel", "1",
+            "--record-channel", "1",
+            "--sample-rate", "1e308",
+            "--json",
+        },
+        {},
+        output,
+        error);
+
+    CP_REQUIRE(exit_code == 2);
+    CP_REQUIRE(error.str().empty());
+    CP_REQUIRE(valid_protocol_jsonl(output.str()));
+    CP_REQUIRE(non_empty_lines(output.str()).size() == 1);
+    CP_REQUIRE(output.str().find("\"category\":\"usage\"") != std::string::npos);
+    CP_REQUIRE(output.str().find("--sample-rate must be between 1000 and 768000 Hz")
+        != std::string::npos);
+    CP_REQUIRE(output.str().find("\"event\":\"recording_progress\"")
+        == std::string::npos);
 }
 
 CP_TEST_CASE("CLI passes a cancellation token into capture commands") {

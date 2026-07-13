@@ -1,3 +1,7 @@
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
 #include "test_framework.hpp"
 
 #include "capture_panel/core/errors.hpp"
@@ -9,6 +13,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <span>
 #include <string>
 #include <system_error>
@@ -30,6 +35,24 @@ public:
     }
 
     ~TemporaryWav() {
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+    }
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept { return path_; }
+
+private:
+    std::filesystem::path path_;
+};
+
+class ScopedTemporaryPath {
+public:
+    explicit ScopedTemporaryPath(std::filesystem::path path) : path_(std::move(path)) {
+        std::error_code ignored;
+        std::filesystem::remove(path_, ignored);
+    }
+
+    ~ScopedTemporaryPath() {
         std::error_code ignored;
         std::filesystem::remove(path_, ignored);
     }
@@ -93,8 +116,14 @@ void write_bytes(const std::filesystem::path& path, const std::span<const std::u
     append_u16(bytes, 32);
 
     append_fourcc(bytes, "data");
-    append_u32(bytes, 12);
-    for (const auto sample : std::array<float, 3>{0.0F, -0.5F, 1.25F}) {
+    append_u32(bytes, 24);
+    for (const auto sample : std::array<float, 6>{
+             0.0F,
+             -0.5F,
+             1.25F,
+             std::numeric_limits<float>::quiet_NaN(),
+             std::numeric_limits<float>::infinity(),
+             -std::numeric_limits<float>::infinity()}) {
         append_u32(bytes, std::bit_cast<std::uint32_t>(sample));
     }
 
@@ -183,6 +212,75 @@ CP_TEST_CASE("WAV writer pads odd-sized PCM24 data chunks") {
     CP_REQUIRE(std::filesystem::file_size(file.path()) == 48);
 }
 
+CP_TEST_CASE("WAV writer atomically replaces a completed existing file") {
+    TemporaryWav file("atomic-replace");
+    write_wav(file.path(), std::vector<float>{0.1F, 0.2F}, 48'000.0, 1);
+    write_wav(file.path(), std::vector<float>{-0.3F, 0.4F, 0.5F}, 48'000.0, 1);
+
+    const auto result = read_wav(file.path());
+    CP_REQUIRE(result.format.total_frames == 3);
+    CP_REQUIRE_NEAR(result.audio.samples[0], -0.3, 1.0 / 8'388'608.0);
+    CP_REQUIRE_NEAR(result.audio.samples[2], 0.5, 1.0 / 8'388'608.0);
+}
+
+CP_TEST_CASE("WAV writer uses a short sibling temp for a long destination component") {
+    auto filename = std::wstring(226, L'x');
+    filename += L".wav";
+    const auto normal_path = std::filesystem::temp_directory_path() / filename;
+    ScopedTemporaryPath file(std::filesystem::path(L"\\\\?\\" + normal_path.native()));
+    CP_REQUIRE(file.path().filename().native().size() == 230U);
+
+    write_wav(file.path(), std::vector<float>{0.125F, -0.25F}, 48'000.0, 1);
+    const auto result = read_wav(file.path());
+    CP_REQUIRE(result.format.total_frames == 2);
+    CP_REQUIRE_NEAR(result.audio.samples[0], 0.125, 1.0 / 8'388'608.0);
+    CP_REQUIRE_NEAR(result.audio.samples[1], -0.25, 1.0 / 8'388'608.0);
+
+    auto fallback_prefix = std::wstring(L".capture-panel.tmp.");
+    fallback_prefix += std::to_wstring(GetCurrentProcessId());
+    fallback_prefix += L'.';
+    for (const auto& entry : std::filesystem::directory_iterator(file.path().parent_path())) {
+        CP_REQUIRE(!entry.path().filename().native().starts_with(fallback_prefix));
+    }
+}
+
+CP_TEST_CASE("WAV atomic replace failure preserves destination and removes sibling temp") {
+    TemporaryWav file("atomic-preserve");
+    const std::vector<float> original{0.1F, -0.2F, 0.3F};
+    write_wav(file.path(), original, 48'000.0, 1);
+
+    const auto locked = CreateFileW(
+        file.path().c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
+    CP_REQUIRE(locked != INVALID_HANDLE_VALUE);
+
+    bool failed = false;
+    try {
+        write_wav(file.path(), std::vector<float>{-0.9F, -0.8F}, 48'000.0, 1);
+    } catch (const CaptureError& error) {
+        failed = error.code() == ErrorCode::wav_write;
+    }
+    static_cast<void>(CloseHandle(locked));
+    CP_REQUIRE(failed);
+
+    const auto preserved = read_wav(file.path());
+    CP_REQUIRE(preserved.audio.samples.size() == original.size());
+    for (std::size_t index = 0; index < original.size(); ++index) {
+        CP_REQUIRE_NEAR(
+            preserved.audio.samples[index], original[index], 1.0 / 8'388'608.0);
+    }
+
+    const auto prefix = file.path().filename().native() + L".capture-panel.tmp.";
+    for (const auto& entry : std::filesystem::directory_iterator(file.path().parent_path())) {
+        CP_REQUIRE(!entry.path().filename().native().starts_with(prefix));
+    }
+}
+
 CP_TEST_CASE("WAV reader accepts IEEE float32 and skips unknown chunks") {
     TemporaryWav file("float");
     const auto bytes = make_float_wav_with_unknown_chunk();
@@ -191,11 +289,15 @@ CP_TEST_CASE("WAV reader accepts IEEE float32 and skips unknown chunks") {
     const auto result = read_wav(file.path());
     CP_REQUIRE(result.format.bit_depth == AudioBitDepth::pcm32);
     CP_REQUIRE(result.format.channel_count == 1);
-    CP_REQUIRE(result.format.total_frames == 3);
+    CP_REQUIRE(result.format.total_frames == 6);
     CP_REQUIRE_NEAR(result.audio.samples[0], 0.0, 1.0e-9);
     CP_REQUIRE_NEAR(result.audio.samples[1], -0.5, 1.0e-9);
     // IEEE float values are already normalized representation; no destructive clamping occurs.
     CP_REQUIRE_NEAR(result.audio.samples[2], 1.25, 1.0e-9);
+    // Non-finite values cannot cross the normalized core/backend boundary.
+    CP_REQUIRE_NEAR(result.audio.samples[3], 0.0, 1.0e-9);
+    CP_REQUIRE_NEAR(result.audio.samples[4], 1.0, 1.0e-9);
+    CP_REQUIRE_NEAR(result.audio.samples[5], -1.0, 1.0e-9);
 }
 
 CP_TEST_CASE("WAV reader accepts extensible PCM and honors valid bits") {

@@ -23,6 +23,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private AudioChannelInfo? _selectedRecordChannel;
     private string? _sourcePath;
     private WavMetadata? _sourceMetadata;
+    private WavFileSnapshot? _sourceSnapshot;
+    private int _sourceSelectionVersion;
     private double _outputTrimDb;
     private double _inputTrimDb;
     private double? _outputPeakDb;
@@ -42,6 +44,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private string _progressLabel = "Idle";
     private double? _remainingSeconds;
     private string? _lastOutputPath;
+    private string? _captureWarningMessage;
+    private string? _recoveryOutputPath;
     private CancellationTokenSource? _operationCancellation;
     private CancellationTokenSource? _deviceCancellation;
     private CancellationTokenSource? _channelCancellation;
@@ -69,12 +73,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         _inputTrimDb = Math.Clamp(Math.Round(_settings.InputTrimDb), -18, 12);
 
         var savedSourcePath = _settings.SourcePath;
-        if (!string.IsNullOrWhiteSpace(savedSourcePath) && File.Exists(savedSourcePath))
+        if (!string.IsNullOrWhiteSpace(savedSourcePath))
         {
             try
             {
-                _sourceMetadata = WavMetadataReader.Read(savedSourcePath);
-                _sourcePath = savedSourcePath;
+                _sourcePath = Path.GetFullPath(savedSourcePath);
             }
             catch (Exception)
             {
@@ -190,7 +193,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     public string SourceName => SourcePath is null
         ? "Choose WAV"
         : MiddleTruncate(Path.GetFileName(SourcePath), 32);
-    public bool SourceReady => SourcePath is not null && _sourceMetadata is not null;
+    public bool SourceReady => SourcePath is not null && _sourceMetadata is not null && _sourceSnapshot is not null;
 
     public string SourceDescription => _sourceMetadata is null
         ? "Select the signal you want to capture"
@@ -438,6 +441,24 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         private set => SetProperty(ref _lastOutputPath, value);
     }
 
+    public string? CaptureWarningMessage
+    {
+        get => _captureWarningMessage;
+        private set
+        {
+            if (SetProperty(ref _captureWarningMessage, value))
+            {
+                NotifyStateChanged();
+            }
+        }
+    }
+
+    public string? RecoveryOutputPath
+    {
+        get => _recoveryOutputPath;
+        private set => SetProperty(ref _recoveryOutputPath, value);
+    }
+
     public bool ControlsLocked => IsRefreshingDevices || IsTesting || IsCapturing;
     public bool AudioReady => !_deviceDiscoveryFailed
         && SelectedOutputDevice?.CanCapture == true
@@ -483,6 +504,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (IsCancelling) return "Cancelling";
             if (IsCapturing) return "Capturing";
             if (IsTesting) return "Testing";
+            if (IsRefreshingDevices) return "Refreshing Devices";
+            if (CaptureWarningMessage is not null) return "Saved with Warning";
+            if (Assessment.StartsWith("Capture failed:", StringComparison.Ordinal)) return "Capture Failed";
+            if (Assessment.StartsWith("The WAV source", StringComparison.Ordinal)) return "Source Error";
             if (CanCapture) return "Ready";
             if (SelectedOutputDevice is null || !AudioReady) return "Select Device";
             if (!SourceReady) return "Choose Source";
@@ -495,16 +520,19 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         get
         {
             if (IsCancelling) return "Stopping the isolated audio worker...";
+            if (IsRefreshingDevices) return "Refreshing ASIO devices...";
             if (IsCapturing || IsTesting)
             {
                 var remaining = RemainingSeconds is > 0 ? $" {FormatDuration(RemainingSeconds.Value)} left" : string.Empty;
                 var percent = ProgressFraction is not null ? $" {Math.Floor(ProgressPercent):0}%" : string.Empty;
                 return $"{ProgressLabel}{percent}{remaining}";
             }
+            if (Assessment.StartsWith("The WAV source", StringComparison.Ordinal)) return Assessment;
             if (OutputDeviceUnavailableMessage is not null) return OutputDeviceUnavailableMessage;
             if (SelectedOutputDevice is null) return "Choose an ASIO driver.";
             if (!AudioReady) return "Choose playback and recording channels.";
             if (!SourceReady) return "Choose a WAV source.";
+            if (CaptureWarningMessage is not null) return CaptureWarningMessage;
             if (Assessment == "Capture saved." && LastOutputPath is not null)
             {
                 return $"Saved {Path.GetFileName(LastOutputPath)}.";
@@ -529,9 +557,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         get
         {
             if (IsTesting || IsCapturing || IsCancelling || IsRefreshingDevices) return StatusKind.Working;
+            if (Assessment.StartsWith("Capture failed:", StringComparison.Ordinal)) return StatusKind.Error;
+            if (Assessment.StartsWith("The WAV source", StringComparison.Ordinal)) return StatusKind.Error;
             if (CanCapture)
             {
-                return StabilityLevel == CaptureStabilityLevel.Caution
+                return StabilityLevel == CaptureStabilityLevel.Caution || CaptureWarningMessage is not null
                     ? StatusKind.Warning
                     : StatusKind.Ready;
             }
@@ -567,7 +597,43 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
     }
 
-    public async Task InitializeAsync() => await RefreshDevicesAsync(preserveVerification: true);
+    public async Task InitializeAsync()
+    {
+        var sourceLoad = LoadSavedSourceAsync();
+        await RefreshDevicesAsync(preserveVerification: true);
+        await sourceLoad;
+    }
+
+    private async Task LoadSavedSourceAsync()
+    {
+        var path = SourcePath;
+        var selectionVersion = _sourceSelectionVersion;
+        if (path is null)
+        {
+            return;
+        }
+
+        try
+        {
+            var snapshot = await Task.Run(() => WavMetadataReader.ReadMetadataSnapshot(path));
+            if (!_disposed
+                && selectionVersion == _sourceSelectionVersion
+                && string.Equals(SourcePath, path, StringComparison.OrdinalIgnoreCase))
+            {
+                SetSourceSnapshot(snapshot);
+            }
+        }
+        catch (Exception exception)
+        {
+            if (!_disposed
+                && selectionVersion == _sourceSelectionVersion
+                && string.Equals(SourcePath, path, StringComparison.OrdinalIgnoreCase))
+            {
+                SetSourceSnapshot(null);
+                Assessment = $"The WAV source is no longer available: {exception.Message}";
+            }
+        }
+    }
 
     public async Task RefreshDevicesAsync(bool preserveVerification = false)
     {
@@ -658,21 +724,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void ChooseSource()
     {
-        var path = _fileDialogs.ChooseSourceWav();
-        if (path is null)
-        {
-            return;
-        }
-
         try
         {
-            var metadata = WavMetadataReader.Read(path);
-            var changed = !string.Equals(SourcePath, path, StringComparison.OrdinalIgnoreCase);
-            _sourceMetadata = metadata;
-            SourcePath = Path.GetFullPath(path);
+            var path = _fileDialogs.ChooseSourceWav();
+            if (path is null)
+            {
+                return;
+            }
+            var snapshot = WavMetadataReader.ReadMetadataSnapshot(path);
+            var changed = _sourceSnapshot is null || !SourceSnapshotsMatch(_sourceSnapshot, snapshot);
+            _sourceSelectionVersion++;
+            SourcePath = snapshot.FullPath;
+            SetSourceSnapshot(snapshot);
             _settings = _settings with { SourcePath = SourcePath };
             SaveSettings();
-            OnPropertyChanged(nameof(SourceDescription));
             if (changed)
             {
                 InvalidateVerification("Source changed. Test again.");
@@ -692,21 +757,40 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        _operationCancellation = new CancellationTokenSource(_setupTestTimeout);
-        var operationToken = _operationCancellation.Token;
+        var operationCancellation = new CancellationTokenSource(_setupTestTimeout);
+        _operationCancellation = operationCancellation;
+        var operationToken = operationCancellation.Token;
         BeginSetupTest();
         try
         {
+            var sourceSnapshot = await RevalidateSourceAsync(operationToken);
+            if (sourceSnapshot is null)
+            {
+                return;
+            }
             var request = new SetupTestRequest(
                 SelectedOutputDevice.Id,
                 SelectedPlaybackChannel.Index,
                 SelectedRecordChannel.Index,
                 OutputTrimDb,
                 InputTrimDb,
-                _sourceMetadata.SampleRate);
-            var progress = new Progress<WorkerProgress>(value => ApplyProgress(value, isTest: true));
+                sourceSnapshot.Metadata.SampleRate);
+            var progress = new Progress<WorkerProgress>(value =>
+            {
+                if (ReferenceEquals(_operationCancellation, operationCancellation)
+                    && !operationToken.IsCancellationRequested
+                    && IsTesting)
+                {
+                    ApplyProgress(value, isTest: true);
+                }
+            });
             var result = await _worker.TestAsync(request, progress, operationToken);
             operationToken.ThrowIfCancellationRequested();
+            if (await ReadSourceIfUnchangedAsync(sourceSnapshot, operationToken) is null)
+            {
+                return;
+            }
+            ValidateSetupTestResult(result, sourceSnapshot.Metadata.SampleRate);
             ApplySetupTestResult(result);
         }
         catch (OperationCanceledException)
@@ -732,8 +816,11 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         finally
         {
-            _operationCancellation.Dispose();
-            _operationCancellation = null;
+            operationCancellation.Dispose();
+            if (ReferenceEquals(_operationCancellation, operationCancellation))
+            {
+                _operationCancellation = null;
+            }
             IsTesting = false;
             ProgressFraction = null;
             RemainingSeconds = null;
@@ -755,7 +842,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private async Task RunCaptureAsync()
     {
         if (!CanCapture || SelectedOutputDevice is null || SelectedPlaybackChannel is null
-            || SelectedRecordChannel is null || SourcePath is null)
+            || SelectedRecordChannel is null || SourcePath is null || _sourceSnapshot is null)
         {
             return;
         }
@@ -772,36 +859,69 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             ?? throw new InvalidOperationException("The capture destination has no parent directory.");
         var temporaryPath = Path.Combine(
             directory,
-            $".{Guid.NewGuid():N}-{Path.GetFileNameWithoutExtension(fullDestination)}.tmp.wav");
+            $".capture-panel-{Guid.NewGuid():N}.tmp.wav");
 
-        _operationCancellation = new CancellationTokenSource();
-        var operationToken = _operationCancellation.Token;
+        var operationCancellation = new CancellationTokenSource();
+        _operationCancellation = operationCancellation;
+        var operationToken = operationCancellation.Token;
+        var validatedOutput = false;
+        var promotedOutput = false;
         IsCapturing = true;
         IsCancelling = false;
+        CaptureWarningMessage = null;
+        RecoveryOutputPath = null;
         ProgressFraction = 0;
         ProgressLabel = "Preparing...";
         RemainingSeconds = null;
         Assessment = "Capture started.";
         try
         {
+            var sourceSnapshot = await RevalidateSourceAsync(operationToken);
+            if (sourceSnapshot is null)
+            {
+                return;
+            }
+            if (WavMetadataReader.RefersToSameFile(sourceSnapshot, fullDestination))
+            {
+                ProgressLabel = "Failed";
+                var sameFileMessage = "Capture failed: The destination must not overwrite the source WAV.";
+                Assessment = sameFileMessage;
+                RaiseError(sameFileMessage);
+                return;
+            }
+
             var request = new CaptureRequest(
-                SourcePath,
+                sourceSnapshot.FullPath,
                 temporaryPath,
                 SelectedOutputDevice.Id,
                 SelectedPlaybackChannel.Index,
                 SelectedRecordChannel.Index,
                 OutputTrimDb,
                 InputTrimDb);
-            var progress = new Progress<WorkerProgress>(value => ApplyProgress(value, isTest: false));
-            _ = await _worker.CaptureAsync(request, progress, operationToken);
-            operationToken.ThrowIfCancellationRequested();
-            if (!File.Exists(temporaryPath))
+            var progress = new Progress<WorkerProgress>(value =>
             {
-                throw new IOException("The audio worker completed without writing its output file.");
+                if (ReferenceEquals(_operationCancellation, operationCancellation)
+                    && !operationToken.IsCancellationRequested
+                    && IsCapturing)
+                {
+                    ApplyProgress(value, isTest: false);
+                }
+            });
+            var completed = await _worker.CaptureAsync(request, progress, operationToken);
+            operationToken.ThrowIfCancellationRequested();
+            ValidateCaptureCompleted(completed, temporaryPath, sourceSnapshot.Metadata);
+            if (await ReadSourceIfUnchangedAsync(sourceSnapshot, operationToken) is null)
+            {
+                return;
             }
+            validatedOutput = true;
 
             File.Move(temporaryPath, fullDestination, overwrite: true);
+            promotedOutput = true;
             LastOutputPath = fullDestination;
+            CaptureWarningMessage = completed.Warnings.Count == 0
+                ? null
+                : $"Saved {Path.GetFileName(fullDestination)} with warning: {completed.Warnings[0].Message}";
             ProgressLabel = "Saved";
             Assessment = "Capture saved.";
         }
@@ -810,20 +930,48 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             ProgressLabel = "Cancelled";
             Assessment = "Capture cancelled.";
         }
+        catch (Exception) when (operationToken.IsCancellationRequested && !validatedOutput)
+        {
+            // A worker teardown can report its own I/O or driver error after cancellation wins
+            // the race. Until an output has been validated, the user's cancellation is the
+            // authoritative outcome and must not invalidate the previously verified route.
+            ProgressLabel = "Cancelled";
+            Assessment = "Capture cancelled.";
+        }
         catch (Exception exception)
         {
             ProgressLabel = "Failed";
-            var message = $"Capture failed: {exception.Message}";
-            InvalidateVerification(message);
-            StabilityLevel = CaptureStabilityLevel.Failed;
-            StabilityReason = message;
-            RaiseError(Assessment);
+            var recovery = validatedOutput && File.Exists(temporaryPath)
+                ? temporaryPath
+                : null;
+            RecoveryOutputPath = recovery;
+            var message = recovery is null
+                ? $"Capture failed: {exception.Message}"
+                : $"Capture failed: {exception.Message} The validated capture was preserved at '{recovery}'.";
+            if (!validatedOutput)
+            {
+                InvalidateVerification(message);
+                StabilityLevel = CaptureStabilityLevel.Failed;
+                StabilityReason = message;
+            }
+            else
+            {
+                Assessment = message;
+            }
+            RaiseError(message);
         }
         finally
         {
-            TryDelete(temporaryPath);
-            _operationCancellation.Dispose();
-            _operationCancellation = null;
+            TryDeleteNativeSiblingTemporaryFiles(temporaryPath);
+            if (!validatedOutput || promotedOutput)
+            {
+                TryDelete(temporaryPath);
+            }
+            operationCancellation.Dispose();
+            if (ReferenceEquals(_operationCancellation, operationCancellation))
+            {
+                _operationCancellation = null;
+            }
             IsCapturing = false;
             IsCancelling = false;
             ProgressFraction = null;
@@ -849,6 +997,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     {
         IsTesting = true;
         CaptureSetupVerified = false;
+        CaptureWarningMessage = null;
+        RecoveryOutputPath = null;
         SetClippingDetected(false);
         OutputPeakDb = null;
         InputPeakDb = null;
@@ -1021,6 +1171,8 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private void InvalidateVerification(string message)
     {
         CaptureSetupVerified = false;
+        CaptureWarningMessage = null;
+        RecoveryOutputPath = null;
         SetClippingDetected(false);
         OutputPeakDb = null;
         InputPeakDb = null;
@@ -1030,6 +1182,162 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         Assessment = message;
         OnPropertiesChanged(nameof(IsClipping), nameof(LevelText), nameof(LevelState));
     }
+
+    private async Task<WavFileSnapshot?> RevalidateSourceAsync(CancellationToken cancellationToken)
+    {
+        var path = SourcePath;
+        var expected = _sourceSnapshot;
+        if (path is null || expected is null)
+        {
+            InvalidateVerification("Choose a valid WAV source and test again.");
+            return null;
+        }
+
+        return await ReadSourceIfUnchangedAsync(expected, cancellationToken);
+    }
+
+    private async Task<WavFileSnapshot?> ReadSourceIfUnchangedAsync(
+        WavFileSnapshot expected,
+        CancellationToken cancellationToken)
+    {
+        WavFileSnapshot current;
+        try
+        {
+            current = await WavMetadataReader.ReadSnapshotAsync(
+                expected.FullPath,
+                cancellationToken);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            SetSourceSnapshot(null);
+            var message = $"The WAV source is no longer available: {exception.Message}";
+            InvalidateVerification(message);
+            RaiseError(message);
+            return null;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        if (!string.Equals(SourcePath, expected.FullPath, StringComparison.OrdinalIgnoreCase)
+            || !SourceSnapshotsMatch(expected, current))
+        {
+            SetSourceSnapshot(current);
+            var message = "The WAV source changed on disk. Review it and run Test again.";
+            InvalidateVerification(message);
+            RaiseError(message);
+            return null;
+        }
+        if (expected.ContentSha256.Length == 0)
+        {
+            SetSourceSnapshot(current);
+        }
+        return current;
+    }
+
+    private void SetSourceSnapshot(WavFileSnapshot? snapshot)
+    {
+        _sourceSnapshot = snapshot;
+        _sourceMetadata = snapshot?.Metadata;
+        OnPropertiesChanged(nameof(SourceReady), nameof(SourceDescription));
+        NotifyStateChanged();
+    }
+
+    private static bool SourceSnapshotsMatch(WavFileSnapshot expected, WavFileSnapshot current)
+        => string.Equals(expected.FullPath, current.FullPath, StringComparison.OrdinalIgnoreCase)
+            && expected.Metadata == current.Metadata
+            && expected.FileLength == current.FileLength
+            && expected.LastWriteTimeUtc == current.LastWriteTimeUtc
+            && expected.Identity == current.Identity
+            && (expected.ContentSha256.Length == 0
+                || string.Equals(
+                    expected.ContentSha256,
+                    current.ContentSha256,
+                    StringComparison.Ordinal));
+
+    private static void ValidateSetupTestResult(SetupTestResult result, int expectedSampleRate)
+    {
+        if (result.Failures is null || result.Warnings is null
+            || result.Passed != (result.Failures.Count == 0))
+        {
+            throw new InvalidDataException("The setup-test pass flag disagrees with its diagnostics.");
+        }
+        if (!double.IsFinite(result.SampleRate)
+            || result.SampleRate <= 0
+            || Math.Abs(result.SampleRate - expectedSampleRate) > 0.5)
+        {
+            throw new InvalidDataException("The setup test returned an unexpected sample rate.");
+        }
+        if (!IsFiniteInRange(result.OutputPeakDbfs, -1_000, 1_000)
+            || !IsFiniteInRange(result.InputPeakDbfs, -1_000, 1_000)
+            || result.LatencyMilliseconds is { } latency
+                && !IsFiniteInRange(latency, -3_600_000, 3_600_000)
+            || result.TimingErrorFrames is { } timingError
+                && !IsFiniteInRange(timingError, 0, long.MaxValue)
+            || result.Reliability is not ("reliable" or "ambiguous" or "unmeasurable"))
+        {
+            throw new InvalidDataException("The setup test returned invalid measurements.");
+        }
+    }
+
+    private static void ValidateCaptureCompleted(
+        CaptureCompleted completed,
+        string expectedOutputPath,
+        WavMetadata sourceMetadata)
+    {
+        if (completed.Warnings is null)
+        {
+            throw new InvalidDataException("The capture result has no warning collection.");
+        }
+        if (!string.Equals(
+                Path.GetFullPath(completed.OutputPath),
+                Path.GetFullPath(expectedOutputPath),
+                StringComparison.OrdinalIgnoreCase))
+        {
+            throw new InvalidDataException("The audio worker reported a different output path.");
+        }
+        if (!File.Exists(expectedOutputPath))
+        {
+            throw new IOException("The audio worker completed without writing its output file.");
+        }
+
+        var fileLength = new FileInfo(expectedOutputPath).Length;
+        if (completed.FileSize <= 0 || fileLength != completed.FileSize)
+        {
+            throw new InvalidDataException("The captured file size does not match the worker result.");
+        }
+        if (!IsFiniteInRange(
+                completed.SampleRate,
+                CaptureLimits.MinimumSampleRate,
+                CaptureLimits.MaximumSampleRate)
+            || !IsFiniteInRange(completed.ElapsedSeconds, 0, 7 * 24 * 60 * 60)
+            || completed.Channels <= 0
+            || completed.BitDepth is not (16 or 24 or 32)
+            || completed.TargetFrames <= 0
+            || completed.TrimmedFrames < 0
+            || completed.TrimmedFrames > completed.TargetFrames)
+        {
+            throw new InvalidDataException("The audio worker returned invalid capture metadata.");
+        }
+
+        var outputMetadata = WavMetadataReader.Read(expectedOutputPath);
+        if (completed.Channels != 1
+            || completed.BitDepth != sourceMetadata.BitsPerSample
+            || outputMetadata.Channels != completed.Channels
+            || outputMetadata.BitsPerSample != completed.BitDepth
+            || Math.Abs(outputMetadata.SampleRate - completed.SampleRate) > 0.5
+            || outputMetadata.Frames != completed.TargetFrames
+            || completed.TargetFrames != sourceMetadata.Frames
+            || Math.Abs(completed.SampleRate - sourceMetadata.SampleRate) > 0.5)
+        {
+            throw new InvalidDataException("The captured WAV does not match the worker result or source format.");
+        }
+    }
+
+    private static bool IsFiniteInRange(double value, double minimum, double maximum)
+        => double.IsFinite(value) && value >= minimum && value <= maximum;
 
     private void SetClippingDetected(bool value)
     {
@@ -1222,6 +1530,38 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             if (File.Exists(path))
             {
                 File.Delete(path);
+            }
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
+        }
+    }
+
+    private static void TryDeleteNativeSiblingTemporaryFiles(string outputPath)
+    {
+        var directory = Path.GetDirectoryName(outputPath);
+        if (directory is null)
+        {
+            return;
+        }
+
+        var prefix = Path.GetFileName(outputPath) + ".capture-panel.tmp.";
+        try
+        {
+            foreach (var candidate in Directory.EnumerateFiles(
+                         directory,
+                         prefix + "*",
+                         SearchOption.TopDirectoryOnly))
+            {
+                if (Path.GetFileName(candidate).StartsWith(
+                        prefix,
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    TryDelete(candidate);
+                }
             }
         }
         catch (IOException)

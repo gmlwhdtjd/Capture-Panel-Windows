@@ -13,10 +13,12 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -30,16 +32,9 @@ struct ValidatedRoute {
 
 struct PassSource {
     CaptureInputInfo input;
-    AudioBuffer audio;
+    CaptureAudioSource audio;
     ValidatedRoute validated_route;
     std::vector<CaptureWarning> warnings;
-};
-
-struct PassExecution {
-    CaptureInputInfo input;
-    RawAudioCaptureResult raw;
-    PayloadAlignment alignment;
-    std::chrono::duration<double> elapsed{};
 };
 
 struct InputPeakLevels {
@@ -47,21 +42,200 @@ struct InputPeakLevels {
     double clipping_dbfs;
 };
 
-[[nodiscard]] double finite_or_zero(double value) noexcept {
-    return std::isfinite(value) ? value : 0.0;
+[[noreturn]] void throw_gain_error(
+    const std::string& label,
+    const double minimum,
+    const double maximum) {
+    throw CaptureError(
+        ErrorCode::validation_failed,
+        label + " must be between " + std::to_string(minimum)
+            + " and " + std::to_string(maximum) + " dB.");
 }
 
-[[nodiscard]] CapturePassOptions sanitized_options(const CapturePassOptions& options) noexcept {
+[[nodiscard]] double validated_gain(
+    const double value,
+    const double minimum,
+    const double maximum,
+    const std::string& label) {
+    if (!std::isfinite(value) || value < minimum || value > maximum) {
+        throw_gain_error(label, minimum, maximum);
+    }
+    return value;
+}
+
+[[nodiscard]] CapturePassOptions validated_options(const CapturePassOptions& options) {
     return {
-        .playback_gain_db = finite_or_zero(options.playback_gain_db),
-        .recording_gain_db = finite_or_zero(options.recording_gain_db),
+        .playback_gain_db = validated_gain(
+            options.playback_gain_db,
+            constants::gain::output_minimum_db,
+            constants::gain::output_maximum_db,
+            "Output gain"),
+        .recording_gain_db = validated_gain(
+            options.recording_gain_db,
+            constants::gain::input_minimum_db,
+            constants::gain::input_maximum_db,
+            "Input gain"),
     };
 }
 
+[[nodiscard]] CapturePassOptions validated_verification_options(
+    const CapturePassOptions& raw_options,
+    const double output_trim_db,
+    const double input_trim_db) {
+    const auto base = validated_options(raw_options);
+    const auto output_trim = validated_gain(
+        output_trim_db,
+        constants::gain::output_minimum_db,
+        constants::gain::output_maximum_db,
+        "Output trim");
+    const auto input_trim = validated_gain(
+        input_trim_db,
+        constants::gain::input_minimum_db,
+        constants::gain::input_maximum_db,
+        "Input trim");
+    return validated_options({
+        .playback_gain_db = base.playback_gain_db + output_trim,
+        .recording_gain_db = base.recording_gain_db + input_trim,
+    });
+}
+
+void validate_supported_sample_rate(const double sample_rate) {
+    if (!std::isfinite(sample_rate)
+        || sample_rate < constants::audio::minimum_supported_sample_rate
+        || sample_rate > constants::audio::maximum_supported_sample_rate) {
+        throw CaptureError(
+            ErrorCode::unsupported_sample_rate,
+            "Sample rate must be between "
+                + std::to_string(constants::audio::minimum_supported_sample_rate)
+                + " and "
+                + std::to_string(constants::audio::maximum_supported_sample_rate)
+                + " Hz.");
+    }
+}
+
+void validate_capture_source(const WavFormat& format) {
+    if (format.total_frames <= 0 || format.channel_count == 0) {
+        throw CaptureError(
+            ErrorCode::validation_failed,
+            "The source WAV must contain at least one audio frame.");
+    }
+}
+
+void throw_if_cancelled(const std::shared_ptr<CancellationToken>& cancellation) {
+    if (cancellation && cancellation->is_cancelled()) {
+        throw CaptureError(ErrorCode::capture_cancelled, "Capture was cancelled.");
+    }
+}
+
+[[nodiscard]] bool paths_refer_to_same_file(
+    const std::filesystem::path& input,
+    const std::filesystem::path& output) noexcept {
+    if (input == output) return true;
+
+    std::error_code equivalent_error;
+    if (std::filesystem::equivalent(input, output, equivalent_error)
+        && !equivalent_error) {
+        return true;
+    }
+
+    std::error_code input_error;
+    std::error_code output_error;
+    const auto canonical_input = std::filesystem::weakly_canonical(input, input_error);
+    const auto canonical_output = std::filesystem::weakly_canonical(output, output_error);
+    return !input_error && !output_error && canonical_input == canonical_output;
+}
+
+void validate_distinct_paths(const CaptureConfiguration& configuration) {
+    if (paths_refer_to_same_file(configuration.input_path, configuration.output_path)) {
+        throw CaptureError(
+            ErrorCode::validation_failed,
+            "Input and output paths must refer to different files.");
+    }
+}
+
+[[nodiscard]] std::int64_t checked_padding_frames(
+    const double padding_seconds,
+    const double sample_rate) {
+    const auto frames = padding_seconds * sample_rate;
+    if (!std::isfinite(frames) || frames < 0.0
+        || frames >= static_cast<double>(std::numeric_limits<std::int64_t>::max())) {
+        throw CaptureError(ErrorCode::validation_failed, "Capture padding is too large.");
+    }
+    return static_cast<std::int64_t>(std::llround(frames));
+}
+
+[[noreturn]] void throw_invalid_backend_result(const std::string& detail) {
+    throw CaptureError(
+        ErrorCode::backend_failure,
+        "Audio backend returned an invalid capture result: " + detail);
+}
+
+[[nodiscard]] float validate_raw_capture_result(
+    const RawAudioCaptureResult& raw,
+    const CapturePassPlaybackPlan& playback,
+    const CaptureRoute& route,
+    const double padding_seconds,
+    const std::shared_ptr<CancellationToken>& cancellation) {
+    if (!raw.recorded.valid()
+        || !std::isfinite(raw.recorded.sample_rate())
+        || std::abs(raw.recorded.sample_rate() - playback.sample_rate()) > 0.5) {
+        throw_invalid_backend_result("recorded sample rate does not match playback");
+    }
+    if (route.record_channels.size() > std::numeric_limits<std::uint32_t>::max()
+        || raw.recorded.channel_count()
+            != static_cast<std::uint32_t>(route.record_channels.size())) {
+        throw_invalid_backend_result("recorded channel count does not match the route");
+    }
+    if (raw.pre_pad_frames < 0) {
+        throw_invalid_backend_result("pre-pad frame count is negative");
+    }
+    const auto expected_pre_pad = checked_padding_frames(
+        padding_seconds, playback.sample_rate());
+    if (raw.pre_pad_frames != expected_pre_pad) {
+        throw_invalid_backend_result("pre-pad frame count does not match the request");
+    }
+    const auto playback_frames = playback.playback_frame_count;
+    if (playback_frames < 0
+        || raw.pre_pad_frames
+            > (std::numeric_limits<std::int64_t>::max() - playback_frames) / 2) {
+        throw_invalid_backend_result("required capture length overflows");
+    }
+    const auto required_frames = raw.pre_pad_frames + playback_frames + raw.pre_pad_frames;
+    if (raw.recorded.frame_count() < required_frames) {
+        throw_invalid_backend_result("recording ended before all requested frames were captured");
+    }
+
+    if (raw.recorded.path().has_value()) {
+        const auto channels = raw.recorded.channel_count();
+        const auto frames = static_cast<std::uint64_t>(raw.recorded.frame_count());
+        if (frames > std::numeric_limits<std::uintmax_t>::max()
+                / channels / sizeof(float)) {
+            throw_invalid_backend_result("recorded file dimensions overflow");
+        }
+        const auto expected_bytes = static_cast<std::uintmax_t>(frames)
+            * channels * sizeof(float);
+        std::error_code size_error;
+        const auto actual_bytes = std::filesystem::file_size(
+            *raw.recorded.path(), size_error);
+        if (size_error || actual_bytes != expected_bytes) {
+            throw_invalid_backend_result(
+                "recorded file size does not match its declared frame count");
+        }
+        // File-backed capture workers calculate this peak while draining the
+        // recording ring. Re-reading multi-gigabyte scratch audio here would
+        // double disk I/O and delay alignment without strengthening the ASIO
+        // converter contract; exact size and finite peak metadata are checked
+        // at this boundary.
+        if (raw.recorded.raw_peak().has_value()) {
+            return *raw.recorded.raw_peak();
+        }
+    }
+    return raw.recorded.validated_peak_level(default_audio_chunk_frames, cancellation);
+}
+
 [[nodiscard]] InputPeakLevels input_peak_levels(
-    const std::span<const float> recorded_samples,
+    const float raw_peak,
     const double recording_gain_db) noexcept {
-    const auto raw_peak = peak(recorded_samples);
     auto recording_gain = linear_from_dbfs(recording_gain_db);
     if (!std::isfinite(recording_gain)) recording_gain = 1.0;
 
@@ -167,13 +341,20 @@ private:
     const PassSource* source = nullptr) {
     if (warning == CaptureWarning::source_channel_count_mismatch && source != nullptr) {
         std::ostringstream message;
-        message << "The source has " << source->audio.channel_count
+        message << "The source has " << source->input.format.channel_count
                 << " channel(s), but the playback route has "
                 << source->validated_route.route.playback_channels.size()
                 << "; channels are mapped in order.";
         return message.str();
     }
     return std::string(warning_message(warning));
+}
+
+[[nodiscard]] std::filesystem::path scratch_file_prefix(
+    const std::filesystem::path& output_path) {
+    auto prefix = output_path;
+    prefix += ".capture-panel.tmp.";
+    return prefix;
 }
 
 } // namespace
@@ -196,23 +377,45 @@ CapturePassResult CaptureService::capture(
     const CaptureConfiguration& configuration,
     const CapturePassOptions& raw_options,
     std::shared_ptr<CancellationToken> cancellation) {
+    validate_distinct_paths(configuration);
+    throw_if_cancelled(cancellation);
+    const auto options = validated_options(raw_options);
     const auto emit = [this](CaptureEvent event) {
         if (event_handler_) event_handler_(event);
     };
 
     emit({.type = CaptureEventType::started, .message = path_utf8(configuration.input_path)});
-    const auto wav = read_wav(configuration.input_path);
+    const auto format = read_wav_format(configuration.input_path);
+    validate_capture_source(format);
+    validate_supported_sample_rate(format.sample_rate);
+    if (configuration.route.record_channels.size()
+        > std::numeric_limits<std::uint32_t>::max()) {
+        throw CaptureError(
+            ErrorCode::validation_failed,
+            "The recording route has too many channels for WAV output.");
+    }
+    const auto bit_depth = configuration.output_bit_depth.value_or(format.bit_depth);
+    validate_wav_output_capacity(
+        format.total_frames,
+        format.sample_rate,
+        static_cast<std::uint32_t>(configuration.route.record_channels.size()),
+        bit_depth);
+    auto captured_source = CaptureAudioSource::from_wav(configuration.input_path, format);
+    const auto source_peak = captured_source.validated_peak_level(
+        default_audio_chunk_frames, cancellation);
+    throw_if_cancelled(cancellation);
     auto source = PassSource{
-        .input = {.path = configuration.input_path, .format = wav.format},
-        .audio = wav.audio,
+        .input = {.path = configuration.input_path, .format = format},
+        .audio = std::move(captured_source),
         .validated_route = validate_route(*device_provider_, configuration.route),
         .warnings = {},
     };
+    source.audio.validate_identity();
 
-    if (source.audio.channel_count != configuration.route.playback_channels.size()) {
+    if (source.input.format.channel_count != configuration.route.playback_channels.size()) {
         source.warnings.push_back(CaptureWarning::source_channel_count_mismatch);
     }
-    if (peak(source.audio.samples) >= 0.999) {
+    if (source_peak >= 0.999F) {
         source.warnings.push_back(CaptureWarning::source_near_digital_full_scale);
     }
 
@@ -235,12 +438,12 @@ CapturePassResult CaptureService::capture(
         .message = device_event_message(source.validated_route),
     });
 
-    const auto options = sanitized_options(raw_options);
     emit({
         .type = CaptureEventType::stage_changed,
         .stage = CaptureStage::sample_rate_configuration,
         .sample_rate = source.input.format.sample_rate,
     });
+    throw_if_cancelled(cancellation);
     SampleRateRestore restore(
         *device_provider_,
         source.validated_route.device.id,
@@ -262,26 +465,44 @@ CapturePassResult CaptureService::capture(
     });
 
     const auto started = std::chrono::steady_clock::now();
-    auto raw = capture_backend_->capture({
-        .route = configuration.route,
-        .playback = plan.audio,
-        .padding_seconds = constants::alignment::padding_seconds,
-        .cancellation = std::move(cancellation),
-        .progress = [emit, sample_rate = source.input.format.sample_rate](
-                        std::int64_t completed,
-                        std::int64_t total) {
-            emit({
-                .type = CaptureEventType::recording_progress,
-                .progress = CaptureProgress{
-                    .completed_frames = completed,
-                    .total_frames = total,
-                    .sample_rate = sample_rate,
-                },
-            });
-        },
-    });
+    source.audio.validate_identity();
+    RawAudioCaptureResult raw;
+    try {
+        raw = capture_backend_->capture({
+            .route = configuration.route,
+            .playback_plan = plan,
+            .padding_seconds = constants::alignment::padding_seconds,
+            .scratch_file_prefix = scratch_file_prefix(configuration.output_path),
+            .cancellation = cancellation,
+            .progress = [emit, sample_rate = source.input.format.sample_rate](
+                            std::int64_t completed,
+                            std::int64_t total) {
+                emit({
+                    .type = CaptureEventType::recording_progress,
+                    .progress = CaptureProgress{
+                        .completed_frames = completed,
+                        .total_frames = total,
+                        .sample_rate = sample_rate,
+                    },
+                });
+            },
+        });
+    } catch (...) {
+        // Cancellation is user intent and takes precedence over a concurrent
+        // driver/stream failure observed while the backend is unwinding.
+        throw_if_cancelled(cancellation);
+        throw;
+    }
     const auto elapsed = std::chrono::steady_clock::now() - started;
     restore.restore();
+    throw_if_cancelled(cancellation);
+    source.audio.validate_identity();
+    static_cast<void>(validate_raw_capture_result(
+        raw,
+        plan,
+        configuration.route,
+        constants::alignment::padding_seconds,
+        cancellation));
     emit({
         .type = CaptureEventType::capture_finished,
         .elapsed_seconds = std::chrono::duration<double>(elapsed).count(),
@@ -289,8 +510,9 @@ CapturePassResult CaptureService::capture(
     });
 
     emit({.type = CaptureEventType::stage_changed, .stage = CaptureStage::alignment});
-    apply_gain_db(raw.recorded.samples, options.recording_gain_db);
-    auto alignment = align_payload(raw.recorded, {
+    auto alignment = align_payload(
+        raw.recorded,
+        static_cast<float>(linear_from_dbfs(options.recording_gain_db)), {
         .expected_marker_frames = [&] {
             auto frames = plan.marker_frames;
             for (auto& frame : frames) frame += raw.pre_pad_frames;
@@ -319,13 +541,22 @@ CapturePassResult CaptureService::capture(
     });
 
     emit({.type = CaptureEventType::stage_changed, .stage = CaptureStage::output_writing});
-    const auto bit_depth = configuration.output_bit_depth.value_or(source.input.format.bit_depth);
-    write_wav(configuration.output_path, alignment.audio, bit_depth);
+    throw_if_cancelled(cancellation);
+    source.audio.validate_identity();
+    auto aligned_reader = alignment.payload.make_reader();
+    write_wav(
+        configuration.output_path,
+        *aligned_reader,
+        alignment.payload.frame_count,
+        source.input.format.sample_rate,
+        alignment.payload.channel_count(),
+        bit_depth,
+        cancellation);
     CaptureOutputInfo output{
         .path = configuration.output_path,
         .file_size = std::filesystem::file_size(configuration.output_path),
-        .sample_rate = alignment.audio.sample_rate,
-        .channel_count = alignment.audio.channel_count,
+        .sample_rate = source.input.format.sample_rate,
+        .channel_count = alignment.payload.channel_count(),
         .bit_depth = bit_depth,
     };
     emit({
@@ -352,14 +583,16 @@ CaptureVerificationResult CaptureService::verify_setup(
     const auto emit = [this](CaptureEvent event) {
         if (event_handler_) event_handler_(event);
     };
+    throw_if_cancelled(cancellation);
     const auto validated = validate_route(*device_provider_, route);
     const auto sample_rate = requested_sample_rate.value_or(
         validated.device.sample_rate > 0.0
             ? validated.device.sample_rate
             : constants::audio::fallback_sample_rate);
-    if (!std::isfinite(sample_rate) || sample_rate <= 0.0) {
-        throw CaptureError(ErrorCode::unsupported_sample_rate, "Sample rate must be positive.");
-    }
+    validate_supported_sample_rate(sample_rate);
+    throw_if_cancelled(cancellation);
+    const auto options = validated_verification_options(
+        raw_options, output_trim_db, input_trim_db);
 
     emit({
         .type = CaptureEventType::devices_validated,
@@ -380,16 +613,12 @@ CaptureVerificationResult CaptureService::verify_setup(
         .message = path_utf8(input.path),
     });
 
-    const auto options = sanitized_options({
-        .playback_gain_db = raw_options.playback_gain_db + finite_or_zero(output_trim_db),
-        .recording_gain_db = raw_options.recording_gain_db + finite_or_zero(input_trim_db),
-    });
-
     emit({
         .type = CaptureEventType::stage_changed,
         .stage = CaptureStage::sample_rate_configuration,
         .sample_rate = sample_rate,
     });
+    throw_if_cancelled(cancellation);
     SampleRateRestore restore(
         *device_provider_,
         validated.device.id,
@@ -408,35 +637,50 @@ CaptureVerificationResult CaptureService::verify_setup(
             constants::alignment::marker_to_payload_silence_seconds,
     });
     const auto started = std::chrono::steady_clock::now();
-    auto raw = capture_backend_->capture({
-        .route = route,
-        .playback = plan.audio,
-        .padding_seconds = constants::alignment::padding_seconds,
-        .cancellation = std::move(cancellation),
-        .progress = [emit, sample_rate](std::int64_t completed, std::int64_t total) {
-            emit({
-                .type = CaptureEventType::recording_progress,
-                .progress = CaptureProgress{
-                    .completed_frames = completed,
-                    .total_frames = total,
-                    .sample_rate = sample_rate,
-                },
-            });
-        },
-    });
+    RawAudioCaptureResult raw;
+    try {
+        raw = capture_backend_->capture({
+            .route = route,
+            .playback_plan = plan,
+            .padding_seconds = constants::alignment::padding_seconds,
+            .scratch_file_prefix = std::nullopt,
+            .cancellation = cancellation,
+            .progress = [emit, sample_rate](std::int64_t completed, std::int64_t total) {
+                emit({
+                    .type = CaptureEventType::recording_progress,
+                    .progress = CaptureProgress{
+                        .completed_frames = completed,
+                        .total_frames = total,
+                        .sample_rate = sample_rate,
+                    },
+                });
+            },
+        });
+    } catch (...) {
+        throw_if_cancelled(cancellation);
+        throw;
+    }
     const auto elapsed = std::chrono::steady_clock::now() - started;
     restore.restore();
+    throw_if_cancelled(cancellation);
+    const auto raw_peak = validate_raw_capture_result(
+        raw,
+        plan,
+        route,
+        constants::alignment::padding_seconds,
+        cancellation);
     emit({
         .type = CaptureEventType::capture_finished,
         .elapsed_seconds = std::chrono::duration<double>(elapsed).count(),
     });
 
     const auto input_peaks = input_peak_levels(
-        raw.recorded.samples,
+        raw_peak,
         options.recording_gain_db);
     emit({.type = CaptureEventType::stage_changed, .stage = CaptureStage::alignment});
-    apply_gain_db(raw.recorded.samples, options.recording_gain_db);
-    auto alignment = align_payload(raw.recorded, {
+    auto alignment = align_payload(
+        raw.recorded,
+        static_cast<float>(linear_from_dbfs(options.recording_gain_db)), {
         .expected_marker_frames = [&] {
             auto frames = plan.marker_frames;
             for (auto& frame : frames) frame += raw.pre_pad_frames;
@@ -464,8 +708,9 @@ CaptureVerificationResult CaptureService::verify_setup(
     });
 
     emit({.type = CaptureEventType::stage_changed, .stage = CaptureStage::verification});
+    throw_if_cancelled(cancellation);
     auto verification = evaluate_verification(
-        alignment.audio,
+        alignment.payload.materialize(),
         signal,
         alignment.info,
         input_peaks.clipping_dbfs);

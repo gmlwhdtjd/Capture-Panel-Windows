@@ -37,10 +37,15 @@ inline constexpr double sequence_match_tolerance_seconds = 0.035;
 inline constexpr std::size_t minimum_sequence_match_tolerance_frames = 8;
 inline constexpr double missing_marker_penalty_seconds = 0.02;
 inline constexpr double minimum_missing_marker_penalty_frames = 16.0;
+// A marker window containing more distinct transients than this is too noisy
+// to align safely. Bounding it also keeps the gap-aware sequence matcher's
+// work deterministic for malformed or adversarial input.
+inline constexpr std::size_t maximum_sequence_candidates = 512;
 } // namespace marker
 
 namespace verification_signal {
 inline constexpr double default_level_dbfs = -12.0;
+inline constexpr std::uint32_t maximum_channel_count = 256;
 inline constexpr double leading_silence_seconds = 0.1;
 inline constexpr double sweep_seconds = 0.3;
 inline constexpr double trailing_silence_seconds = 0.5;
@@ -74,8 +79,17 @@ inline constexpr double recorded_energy_floor = 0.0000001;
 
 namespace audio {
 inline constexpr double fallback_sample_rate = 48'000.0;
+inline constexpr double minimum_supported_sample_rate = 1'000.0;
+inline constexpr double maximum_supported_sample_rate = 768'000.0;
 inline constexpr double capture_timeout_margin_seconds = 5.0;
 inline constexpr double capture_timeout_minimum_seconds = 10.0;
 } // namespace audio
+
+namespace gain {
+inline constexpr double output_minimum_db = -24.0;
+inline constexpr double output_maximum_db = 0.0;
+inline constexpr double input_minimum_db = -18.0;
+inline constexpr double input_maximum_db = 12.0;
+} // namespace gain
 
 } // namespace capture_panel::constants

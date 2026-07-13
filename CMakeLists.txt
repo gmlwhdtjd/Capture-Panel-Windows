@@ -30,17 +30,31 @@ function(capture_panel_enable_warnings target)
     endif()
 endfunction()
 
+add_library(capture_panel_windows_platform STATIC
+    src/platform/windows/atomic_file_transaction.cpp
+)
+target_include_directories(capture_panel_windows_platform
+    PRIVATE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/platform/windows>
+)
+target_compile_features(capture_panel_windows_platform PRIVATE cxx_std_20)
+capture_panel_enable_warnings(capture_panel_windows_platform)
+
 add_library(capture_panel_core STATIC
     src/core/src/audio.cpp
     src/core/src/alignment.cpp
     src/core/src/capture.cpp
     src/core/src/channels.cpp
+    src/core/src/streaming.cpp
     src/core/src/verification.cpp
     src/core/src/wav.cpp
 )
+target_link_libraries(capture_panel_core PRIVATE capture_panel_windows_platform)
 target_include_directories(capture_panel_core
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/core/include>
+    PRIVATE
+        src/platform/windows
 )
 target_compile_features(capture_panel_core PUBLIC cxx_std_20)
 capture_panel_enable_warnings(capture_panel_core)
@@ -61,6 +75,8 @@ add_library(capture_panel_asio STATIC
     src/backends/asio/src/asio_driver_registry.cpp
     src/backends/asio/src/asio_driver_session.cpp
     src/backends/asio/src/asio_sample_converter.cpp
+    src/backends/asio/src/asio_stream_workers.cpp
+    src/backends/asio/src/asio_temporary_float_file.cpp
 )
 target_include_directories(capture_panel_asio
     PUBLIC
@@ -103,7 +119,10 @@ target_compile_definitions(
 )
 capture_panel_enable_warnings(capture_panel_cli_lib)
 
-add_executable(capture-panel src/cli/main.cpp)
+add_executable(capture-panel
+    src/cli/main.cpp
+    src/cli/app.manifest
+)
 target_link_libraries(capture-panel PRIVATE capture_panel_cli_lib)
 capture_panel_enable_warnings(capture-panel)
 
@@ -118,15 +137,20 @@ if(CAPTURE_PANEL_BUILD_TESTS)
     add_executable(capture_panel_tests
         tests/test_main.cpp
         tests/alignment_tests.cpp
+        tests/asio_callback_lifetime_tests.cpp
         tests/asio_buffer_timeline_tests.cpp
         tests/asio_driver_registry_tests.cpp
         tests/asio_sample_converter_tests.cpp
+        tests/asio_spsc_ring_tests.cpp
+        tests/asio_stream_workers_tests.cpp
+        tests/asio_temporary_float_file_tests.cpp
         tests/audio_tests.cpp
         tests/backend_router_tests.cpp
         tests/capture_tests.cpp
         tests/channel_tests.cpp
         tests/cli_tests.cpp
         tests/fake_backend_tests.cpp
+        tests/streaming_tests.cpp
         tests/verification_tests.cpp
         tests/wav_tests.cpp
     )

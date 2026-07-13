@@ -21,8 +21,9 @@
 
 ```text
 capture_panel_core
-  |-- WAV, levels, capture orchestration
-  |-- marker alignment and setup verification
+  |-- streaming WAV readers/writer, levels, capture orchestration
+  |-- bounded-window marker alignment and setup verification
+  |-- private Windows atomic-file transaction adapter
   +-- IAudioDeviceProvider + IAudioCaptureBackend
           |
           +-- FakeAudioBackend
@@ -30,6 +31,7 @@ capture_panel_core
                     |-- 64-bit registry discovery
                     |-- COM driver session + hidden HWND
                     |-- PCM sample conversion
+                    |-- bounded playback/record SPSC rings
                     +-- allocation-free double-buffer callback
 
 BackendRouter
@@ -44,7 +46,9 @@ CapturePanel.exe (WPF)
           +-- core + BackendRouter + ASIO backend
 ```
 
-The core never includes Windows, ASIO, WPF, or .NET types. Core audio is
+The core public API and audio algorithms never expose Windows, ASIO, WPF, or
+.NET types. A private Windows adapter performs same-directory atomic output
+promotion without leaking Win32 handles into the WAV layer. Core audio is
 normalized interleaved float32. The ASIO boundary converts it to and from the
 native channel-planar driver format.
 
@@ -63,6 +67,7 @@ Capture-Panel-Windows/
 |   |   |-- asio/
 |   |   +-- router/
 |   |-- cli/
+|   |-- platform/windows/
 |   +-- ui/CapturePanel.App/
 |-- tests/
 |   +-- ui/
@@ -75,8 +80,10 @@ Capture-Panel-Windows/
 
 `IAudioDeviceProvider` lists devices/channels and changes sample rate.
 `IAudioCaptureBackend` performs a synchronous full-duplex capture from a
-prepared playback buffer. The result is a recorded float buffer and the number
-of pre-padding frames.
+`CapturePassPlaybackPlan`, which describes a source reader, marker positions,
+gain, and logical frame boundaries without containing the complete source.
+The result is a `Float32AudioAsset` (normally a temporary interleaved file) and
+the number of pre-padding frames.
 
 ASIO driver IDs use `asio:{CANONICAL-CLSID}`. Fake uses `fake:loopback`.
 No ASIO buffer, sample type, COM object, or clock type crosses the core
@@ -98,14 +105,22 @@ CoInitializeEx(STA) -> hidden HWND -> CoCreateInstance -> init
   -> stop -> disposeBuffers -> Release -> DestroyWindow -> CoUninitialize
 ```
 
-The driver callback performs only bounded sample copies/conversion and atomic
-state publication. It does not allocate, lock, log, perform file I/O, invoke
-progress handlers, or touch managed code. Progress, cancellation, timeouts, and
-driver event decisions run on the control thread.
+The driver callback performs only bounded sample copies/conversion, exact SPSC
+ring transfers, and atomic state publication. It does not allocate, lock, log,
+perform file I/O, invoke progress handlers, or touch managed code. Source
+decoding and raw recording writes run on separate workers. Progress,
+cancellation, timeouts, and driver event decisions run on the control thread.
 
 Because ASIO callbacks carry no user-data pointer, the process permits one
-active ASIO capture. Public channel numbers are one-based while
-`ASIOBufferInfo.channelNum` is zero-based.
+active ASIO operation. A process-wide lease serializes discovery, channel
+queries, sample-rate changes, and captures so two threads cannot initialize the
+same vendor driver concurrently. Callback targets use a lock-free lifetime
+gate; teardown is
+`stop -> close/drain callback gate -> stop/join workers -> disposeBuffers`,
+including partial `createBuffers` and `start` failures. Public channel numbers
+are one-based while `ASIOBufferInfo.channelNum` is zero-based. See
+[Streaming Audio Architecture](STREAMING_AUDIO_ARCHITECTURE.md) for the complete
+data flow.
 
 ## WPF boundary
 
@@ -114,6 +129,13 @@ The managed layer is control-plane only. It starts `capture-panel.exe` with
 terminates the worker to cancel or contain an unresponsive operation. Device
 metadata, progress, diagnostics, and final results cross the process boundary;
 audio samples and driver callbacks remain in the native worker.
+
+Only one worker runs per application client. Every worker is assigned to a
+`KILL_ON_JOB_CLOSE` Windows Job Object, and cancellation/error cleanup has a
+bounded wait. The managed boundary treats JSON as untrusted protocol data: it
+checks result invariants and exit codes, fingerprints the source before and
+after work, validates the completed WAV against the request, and only then
+promotes the temporary file to the selected destination.
 
 The Test result's `inputPeakDbfs` is the peak after input trim, matching the
 level shown by the desktop application. `digital_clipping` is evaluated against
@@ -134,4 +156,6 @@ application and managed tests. Release publishing creates a self-contained
 packages both with licenses, documentation, and corresponding source. CI does
 not open an ASIO driver. Physical routing remains a manual or protected
 self-hosted gate because hosted runners have neither the vendor driver nor the
-device.
+device. Release packaging runs with read-only repository permission; only the
+final artifact-verification/release job receives `contents: write`, and it
+rechecks the tag target and packaged SHA-256 values before publishing.

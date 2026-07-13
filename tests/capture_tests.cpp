@@ -7,9 +7,12 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cwctype>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -117,6 +120,109 @@ private:
             throw CaptureError(ErrorCode::device_not_found, "Audio driver not found: " + id);
         }
     }
+};
+
+enum class RawResultDefect {
+    wrong_sample_rate,
+    wrong_channel_count,
+    partial_frame,
+    negative_pre_pad,
+    too_short,
+    non_finite_sample,
+};
+
+class ContractViolatingBackend final
+    : public IAudioDeviceProvider,
+      public IAudioCaptureBackend {
+public:
+    explicit ContractViolatingBackend(const RawResultDefect defect) : defect_(defect) {}
+
+    [[nodiscard]] std::vector<AudioDevice> devices() const override {
+        return {device("malformed:capture")};
+    }
+
+    [[nodiscard]] AudioDevice device(const std::string& id) const override {
+        validate_id(id);
+        return {
+            .id = "malformed:capture",
+            .name = "Malformed capture backend",
+            .input_channels = 2,
+            .output_channels = 1,
+            .sample_rate = sample_rate_,
+            .available = true,
+        };
+    }
+
+    [[nodiscard]] std::vector<AudioChannel> channels(
+        const std::string& id,
+        const ChannelDirection direction) const override {
+        validate_id(id);
+        const auto count = direction == ChannelDirection::input ? 2U : 1U;
+        std::vector<AudioChannel> result;
+        for (std::uint32_t index = 1; index <= count; ++index) {
+            result.push_back({.index = index, .name = "Channel " + std::to_string(index)});
+        }
+        return result;
+    }
+
+    void set_sample_rate(const std::string& id, const double sample_rate) override {
+        validate_id(id);
+        sample_rate_ = sample_rate;
+    }
+
+    RawAudioCaptureResult capture(const RawAudioCaptureRequest& request) override {
+        const auto pre_pad = static_cast<std::int64_t>(std::llround(
+            request.padding_seconds * request.playback_plan.sample_rate()));
+        const auto required_frames = pre_pad
+            + request.playback_plan.playback_frame_count + pre_pad;
+        const auto channel_count = static_cast<std::uint32_t>(
+            request.route.record_channels.size());
+        AudioBuffer recorded{
+            .sample_rate = request.playback_plan.sample_rate(),
+            .channel_count = channel_count,
+            .samples = std::vector<float>(
+                static_cast<std::size_t>(required_frames) * channel_count,
+                0.0F),
+        };
+        auto result_pre_pad = pre_pad;
+
+        switch (defect_) {
+        case RawResultDefect::wrong_sample_rate:
+            recorded.sample_rate += 1'000.0;
+            break;
+        case RawResultDefect::wrong_channel_count:
+            recorded.channel_count = 1;
+            recorded.samples.resize(static_cast<std::size_t>(required_frames));
+            break;
+        case RawResultDefect::partial_frame:
+            throw CaptureError(
+                ErrorCode::backend_failure,
+                "A backend cannot publish a partial frame through the streaming contract.");
+        case RawResultDefect::negative_pre_pad:
+            result_pre_pad = -1;
+            break;
+        case RawResultDefect::too_short:
+            recorded.samples.resize(recorded.samples.size() - channel_count);
+            break;
+        case RawResultDefect::non_finite_sample:
+            recorded.samples.front() = std::numeric_limits<float>::quiet_NaN();
+            break;
+        }
+        return {
+            .recorded = Float32AudioAsset::from_memory(std::move(recorded)),
+            .pre_pad_frames = result_pre_pad,
+        };
+    }
+
+private:
+    static void validate_id(const std::string& id) {
+        if (id != "malformed:capture") {
+            throw CaptureError(ErrorCode::device_not_found, "Audio driver not found: " + id);
+        }
+    }
+
+    RawResultDefect defect_;
+    double sample_rate_ = 48'000.0;
 };
 
 } // namespace
@@ -294,6 +400,222 @@ CP_TEST_CASE("CaptureService propagates cancellation from the fake backend") {
     }
     CP_REQUIRE(cancelled);
     CP_REQUIRE(!std::filesystem::exists(files.output));
+}
+
+CP_TEST_CASE("CaptureService cancellation before rate configuration has no device side effect") {
+    TemporaryWavPair files("capture-panel-cancel-before-rate");
+    write_wav(files.input, sine_source(44'100.0, 441), AudioBitDepth::pcm24);
+
+    auto backend = std::make_shared<capture_panel::fake::FakeAudioBackend>();
+    auto cancellation = std::make_shared<CancellationToken>();
+    CaptureService service(backend, backend, [&](const CaptureEvent& event) {
+        if (event.type == CaptureEventType::input_loaded) cancellation->cancel();
+    });
+
+    bool cancelled = false;
+    try {
+        static_cast<void>(service.capture(configuration_for(files), {}, cancellation));
+    } catch (const CaptureError& error) {
+        cancelled = error.code() == ErrorCode::capture_cancelled;
+    }
+    CP_REQUIRE(cancelled);
+    CP_REQUIRE_NEAR(
+        backend->device(std::string(capture_panel::fake::loopback_device_id)).sample_rate,
+        48'000.0,
+        0.5);
+    CP_REQUIRE(!std::filesystem::exists(files.output));
+}
+
+CP_TEST_CASE("CaptureService setup cancellation before rate configuration has no device side effect") {
+    auto backend = std::make_shared<capture_panel::fake::FakeAudioBackend>();
+    auto cancellation = std::make_shared<CancellationToken>();
+    CaptureService service(backend, backend, [&](const CaptureEvent& event) {
+        if (event.type == CaptureEventType::devices_validated) cancellation->cancel();
+    });
+
+    bool cancelled = false;
+    try {
+        static_cast<void>(service.verify_setup(
+            {
+                .driver_id = std::string(capture_panel::fake::loopback_device_id),
+                .playback_channels = {1},
+                .record_channels = {1},
+            },
+            44'100.0,
+            0.0,
+            0.0,
+            {},
+            cancellation));
+    } catch (const CaptureError& error) {
+        cancelled = error.code() == ErrorCode::capture_cancelled;
+    }
+    CP_REQUIRE(cancelled);
+    CP_REQUIRE_NEAR(
+        backend->device(std::string(capture_panel::fake::loopback_device_id)).sample_rate,
+        48'000.0,
+        0.5);
+}
+
+CP_TEST_CASE("CaptureService rejects a zero-frame source before capture") {
+    TemporaryWavPair files("capture-panel-empty-source");
+    write_wav(
+        files.input,
+        AudioBuffer{.sample_rate = 48'000.0, .channel_count = 1, .samples = {}},
+        AudioBitDepth::pcm24);
+
+    auto backend = std::make_shared<capture_panel::fake::FakeAudioBackend>();
+    CaptureService service(backend, backend);
+    bool failed = false;
+    try {
+        static_cast<void>(service.capture(configuration_for(files)));
+    } catch (const CaptureError& error) {
+        failed = error.code() == ErrorCode::validation_failed;
+    }
+
+    CP_REQUIRE(failed);
+    CP_REQUIRE(!std::filesystem::exists(files.output));
+}
+
+CP_TEST_CASE("CaptureService rejects duplicate routes before changing the sample rate") {
+    TemporaryWavPair files("capture-panel-duplicate-route");
+    write_wav(files.input, sine_source(44'100.0, 441), AudioBitDepth::pcm24);
+
+    for (const auto duplicate_playback : {true, false}) {
+        auto backend = std::make_shared<capture_panel::fake::FakeAudioBackend>();
+        CaptureService service(backend, backend);
+        auto configuration = configuration_for(files);
+        configuration.route.playback_channels = duplicate_playback
+            ? std::vector<std::uint32_t>{1, 1}
+            : std::vector<std::uint32_t>{1};
+        configuration.route.record_channels = duplicate_playback
+            ? std::vector<std::uint32_t>{1}
+            : std::vector<std::uint32_t>{1, 1};
+
+        bool failed = false;
+        try {
+            static_cast<void>(service.capture(configuration));
+        } catch (const CaptureError& error) {
+            failed = error.code() == ErrorCode::validation_failed;
+        }
+        CP_REQUIRE(failed);
+        CP_REQUIRE_NEAR(
+            backend->device(std::string(capture_panel::fake::loopback_device_id)).sample_rate,
+            48'000.0,
+            0.01);
+        CP_REQUIRE(!std::filesystem::exists(files.output));
+    }
+}
+
+CP_TEST_CASE("CaptureService rejects every malformed backend capture contract") {
+    const CaptureRoute route{
+        .driver_id = "malformed:capture",
+        .playback_channels = {1},
+        .record_channels = {1, 2},
+    };
+    for (const auto defect : {
+             RawResultDefect::wrong_sample_rate,
+             RawResultDefect::wrong_channel_count,
+             RawResultDefect::partial_frame,
+             RawResultDefect::negative_pre_pad,
+             RawResultDefect::too_short,
+             RawResultDefect::non_finite_sample}) {
+        auto backend = std::make_shared<ContractViolatingBackend>(defect);
+        CaptureService service(backend, backend);
+        bool failed = false;
+        try {
+            static_cast<void>(service.verify_setup(route));
+        } catch (const CaptureError& error) {
+            failed = error.code() == ErrorCode::backend_failure;
+        }
+        CP_REQUIRE(failed);
+    }
+}
+
+CP_TEST_CASE("CaptureService rejects gains outside the desktop control ranges") {
+    auto backend = std::make_shared<capture_panel::fake::FakeAudioBackend>();
+    CaptureService service(backend, backend);
+    const CaptureRoute route{
+        .driver_id = std::string(capture_panel::fake::loopback_device_id),
+        .playback_channels = {1},
+        .record_channels = {1},
+    };
+    for (const auto [output_gain, input_gain] : std::vector<std::pair<double, double>>{
+             {-24.01, 0.0},
+             {0.01, 0.0},
+             {0.0, -18.01},
+             {0.0, 12.01},
+             {std::numeric_limits<double>::infinity(), 0.0},
+             {0.0, std::numeric_limits<double>::quiet_NaN()}}) {
+        bool failed = false;
+        try {
+            static_cast<void>(service.verify_setup(
+                route, std::nullopt, output_gain, input_gain));
+        } catch (const CaptureError& error) {
+            failed = error.code() == ErrorCode::validation_failed;
+        }
+        CP_REQUIRE(failed);
+    }
+
+    TemporaryWavPair files("capture-panel-invalid-gain");
+    bool capture_failed = false;
+    try {
+        static_cast<void>(service.capture(
+            configuration_for(files),
+            CapturePassOptions{.playback_gain_db = 0.5}));
+    } catch (const CaptureError& error) {
+        capture_failed = error.code() == ErrorCode::validation_failed;
+    }
+    CP_REQUIRE(capture_failed);
+}
+
+CP_TEST_CASE("CaptureService rejects same-file paths hard links and case aliases") {
+    enum class AliasKind { same_path, hard_link, case_variant };
+    for (const auto alias_kind : {
+             AliasKind::same_path,
+             AliasKind::hard_link,
+             AliasKind::case_variant}) {
+        TemporaryWavPair files(
+            alias_kind == AliasKind::hard_link
+                ? "capture-panel-hard-link-input"
+                : alias_kind == AliasKind::case_variant
+                    ? "capture-panel-case-input"
+                    : "capture-panel-same-input");
+        const auto source = sine_source(48'000.0, 64);
+        write_wav(files.input, source, AudioBitDepth::pcm24);
+        if (alias_kind == AliasKind::hard_link) {
+            std::error_code link_error;
+            std::filesystem::create_hard_link(files.input, files.output, link_error);
+            CP_REQUIRE(!link_error);
+        }
+
+        auto backend = std::make_shared<capture_panel::fake::FakeAudioBackend>();
+        CaptureService service(backend, backend);
+        auto configuration = configuration_for(files);
+        if (alias_kind == AliasKind::same_path) {
+            configuration.output_path = configuration.input_path;
+        } else if (alias_kind == AliasKind::case_variant) {
+            auto case_alias = configuration.input_path.native();
+            std::transform(
+                case_alias.begin(), case_alias.end(), case_alias.begin(),
+                [](const auto character) {
+                    return static_cast<std::filesystem::path::value_type>(
+                        std::towupper(static_cast<std::wint_t>(character)));
+                });
+            configuration.output_path = std::filesystem::path(case_alias);
+        }
+
+        bool failed = false;
+        try {
+            static_cast<void>(service.capture(configuration));
+        } catch (const CaptureError& error) {
+            failed = error.code() == ErrorCode::validation_failed;
+        }
+        CP_REQUIRE(failed);
+
+        const auto preserved = read_wav(files.input);
+        CP_REQUIRE(preserved.audio.samples.size() == source.samples.size());
+        CP_REQUIRE_NEAR(preserved.audio.samples[7], source.samples[7], 0.00001);
+    }
 }
 
 CP_TEST_CASE("CaptureService restores a partially changed rate when configuration fails") {

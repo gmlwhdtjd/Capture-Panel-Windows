@@ -80,10 +80,24 @@ public sealed class JsonAppSettingsStore : IAppSettingsStore
         }
         finally
         {
-            if (File.Exists(temporaryPath))
+            TryDeleteTemporaryFile(temporaryPath);
+        }
+    }
+
+    private static void TryDeleteTemporaryFile(string path)
+    {
+        try
+        {
+            if (File.Exists(path))
             {
-                File.Delete(temporaryPath);
+                File.Delete(path);
             }
+        }
+        catch (IOException)
+        {
+        }
+        catch (UnauthorizedAccessException)
+        {
         }
     }
 }

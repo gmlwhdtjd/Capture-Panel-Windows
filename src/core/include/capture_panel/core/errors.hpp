@@ -19,6 +19,10 @@ enum class ErrorCode {
     alignment_failed,
     capture_cancelled,
     capture_timed_out,
+    playback_stream_underflow,
+    recording_stream_overflow,
+    source_stream_failure,
+    recording_write_failure,
     backend_failure,
 };
 

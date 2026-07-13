@@ -1,4 +1,7 @@
 using System.IO;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Automation;
 using System.Windows.Controls;
@@ -12,16 +15,29 @@ namespace CapturePanel.App.Tests;
 
 internal static class Program
 {
-    private static async Task<int> Main()
+    private static async Task<int> Main(string[] args)
     {
+        if (args.Length > 0
+            && Environment.GetEnvironmentVariable("CAPTURE_PANEL_TEST_WORKER_MODE") is { } workerMode)
+        {
+            return RunWorkerHelper(workerMode, args);
+        }
+
         var tests = new (string Name, Func<Task> Run)[]
         {
             ("output device selection synchronizes the disabled input device", DeviceSelectionSynchronizesInput),
             ("source test capture gate and trim invalidation", SourceTestGateAndTrimInvalidation),
             ("setup input level uses the Mac verification boundaries", SetupInputLevelUsesMacBoundaries),
             ("clipping blocks capture and reports failed stability", ClippingBlocksCapture),
+            ("changed or missing source files fail closed", SourceChangesFailClosed),
+            ("source changes during Test or Capture discard stale results", SourceChangesDuringWorkerAreRejected),
+            ("capture cannot overwrite its source WAV", CaptureCannotOverwriteSource),
+            ("inconsistent setup-test results are rejected", InconsistentSetupResultIsRejected),
             ("capture uses a temporary output and promotes it on success", CapturePromotesTemporaryOutput),
+            ("capture warnings remain visible after a successful save", CaptureWarningsRemainVisible),
+            ("invalid capture results are never promoted", InvalidCaptureResultsAreRejected),
             ("late worker completion cannot win a capture cancellation", LateCaptureCompletionStaysCancelled),
+            ("capture cancellation wins a concurrent worker error", CaptureCancellationWinsConcurrentWorkerError),
             ("capture failure invalidates setup and remains visible", CaptureFailureInvalidatesSetup),
             ("stale channel discovery cannot overwrite a newer device", StaleChannelDiscoveryIsIgnored),
             ("fallback channels are persisted after a driver change", FallbackChannelsArePersisted),
@@ -31,7 +47,9 @@ internal static class Program
             ("disposing during discovery cancels the worker", DisposeCancelsDeviceDiscovery),
             ("JSON settings persist the Windows route", JsonSettingsRoundTrip),
             ("WAV metadata reader reports source format and frames", WavMetadataRoundTrip),
+            ("WAV metadata reader rejects malformed native-incompatible files", WavMetadataRejectsMalformedFiles),
             ("native JSON worker contract supports Fake test and capture", NativeWorkerJsonContract),
+            ("native worker client serializes and bounds cancellation", WorkerClientSerializesAndCancels),
             ("Windows Fluent views load and lay out off-screen", WindowsFluentViewsLoad),
         };
 
@@ -52,6 +70,94 @@ internal static class Program
 
         Console.WriteLine($"{tests.Length} managed test(s), {failures} failure(s)");
         return failures == 0 ? 0 : 1;
+    }
+
+    private static int RunWorkerHelper(string mode, string[] args)
+    {
+        if (mode is "inconsistent-test" or "failed-test-exit-zero" && args[0] == "test")
+        {
+            Console.WriteLine(JsonSerializer.Serialize(new Dictionary<string, object?>
+            {
+                ["protocol"] = "capture-panel/1",
+                ["type"] = "test_result",
+                ["passed"] = mode == "inconsistent-test",
+                ["sampleRate"] = 48_000,
+                ["outputPeakDbfs"] = -12,
+                ["inputPeakDbfs"] = -18,
+                ["alignment"] = new Dictionary<string, object?>
+                {
+                    ["markerLatencyFrames"] = 60,
+                    ["markerLatencyMilliseconds"] = 1.25,
+                },
+                ["verification"] = new Dictionary<string, object?>
+                {
+                    ["timingFitErrorFrames"] = 4,
+                    ["sweep"] = new Dictionary<string, object?> { ["reliability"] = "reliable" },
+                },
+                ["warnings"] = Array.Empty<object>(),
+                ["failures"] = new[]
+                {
+                    new Dictionary<string, object?>
+                    {
+                        ["code"] = "digital_clipping",
+                        ["message"] = "Clipping was detected.",
+                    },
+                },
+            }));
+            return 0;
+        }
+        if (mode == "capture-warning" && args[0] == "run")
+        {
+            var outputIndex = Array.IndexOf(args, "--output") + 1;
+            var outputPath = args[outputIndex];
+            Fixture.WritePcmWav(outputPath, sampleRate: 48_000, frames: 480);
+            Console.WriteLine(JsonSerializer.Serialize(new Dictionary<string, object?>
+            {
+                ["protocol"] = "capture-panel/1",
+                ["type"] = "event",
+                ["event"] = "warning",
+                ["warning"] = new Dictionary<string, object?>
+                {
+                    ["code"] = "source_near_digital_full_scale",
+                    ["message"] = "The source is at or near digital full scale.",
+                },
+                ["message"] = "The selected source is at or near digital full scale.",
+            }));
+            Console.WriteLine(JsonSerializer.Serialize(new Dictionary<string, object?>
+            {
+                ["protocol"] = "capture-panel/1",
+                ["type"] = "capture_result",
+                ["output"] = new Dictionary<string, object?>
+                {
+                    ["path"] = outputPath,
+                    ["fileSize"] = new FileInfo(outputPath).Length,
+                    ["channelCount"] = 1,
+                    ["bitDepth"] = 24,
+                    ["sampleRate"] = 48_000,
+                },
+                ["alignment"] = new Dictionary<string, object?>
+                {
+                    ["markerLatencyFrames"] = 60,
+                    ["markerLatencyMilliseconds"] = 1.25,
+                    ["trimmedFrameCount"] = 480,
+                    ["targetFrameCount"] = 480,
+                },
+                ["elapsedSeconds"] = 0.1,
+            }));
+            return 0;
+        }
+        if (args[0] != "devices")
+        {
+            return 2;
+        }
+        if (mode == "hang")
+        {
+            Thread.Sleep(Timeout.Infinite);
+        }
+        Thread.Sleep(300);
+        Console.WriteLine(
+            "{\"protocol\":\"capture-panel/1\",\"type\":\"devices\",\"devices\":[]}");
+        return 0;
     }
 
     private static async Task DeviceSelectionSynchronizesInput()
@@ -159,6 +265,180 @@ internal static class Program
         Equal("Clipping detected. Lower output or input, then test again.", model.Assessment);
     }
 
+    private static async Task SourceChangesFailClosed()
+    {
+        using (var fixture = new Fixture())
+        using (var model = fixture.CreateModel())
+        {
+            await model.InitializeAsync();
+            model.ChooseSourceCommand.Execute(null);
+            model.TestCommand.Execute(null);
+            await WaitUntil(() => model.CanCapture);
+
+            Fixture.WritePcmWav(fixture.SourcePath, sampleRate: 44_100, frames: 480);
+            model.ChooseSourceCommand.Execute(null);
+
+            Require(!model.CaptureSetupVerified,
+                "Reselecting a changed source at the same path must invalidate Test.");
+            Require(model.SourceDescription.StartsWith("44.1 kHz", StringComparison.Ordinal),
+                "Reselecting should refresh the source metadata.");
+        }
+
+        using (var fixture = new Fixture())
+        using (var model = fixture.CreateModel())
+        {
+            await model.InitializeAsync();
+            model.ChooseSourceCommand.Execute(null);
+            model.TestCommand.Execute(null);
+            await WaitUntil(() => model.CanCapture);
+            File.Delete(fixture.SourcePath);
+
+            model.CaptureCommand.Execute(null);
+            await WaitUntil(() => !model.IsCapturing && !model.SourceReady);
+
+            Equal(0, fixture.Worker.CaptureCalls);
+            Require(!model.CanCapture, "A missing source must disable Capture.");
+            Require(model.Assessment.Contains("no longer available", StringComparison.Ordinal),
+                "The missing-source reason should remain visible.");
+            Equal(StatusKind.Error, model.StatusKind);
+            Equal(model.Assessment, model.StatusMessage);
+        }
+    }
+
+    private static async Task SourceChangesDuringWorkerAreRejected()
+    {
+        using (var fixture = new Fixture())
+        {
+            fixture.Worker.HoldTestCompletion = true;
+            using var model = fixture.CreateModel();
+            await model.InitializeAsync();
+            model.ChooseSourceCommand.Execute(null);
+
+            model.TestCommand.Execute(null);
+            await fixture.Worker.TestStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            MutateWavPayload(fixture.SourcePath);
+            fixture.Worker.ReleaseTestCompletion.TrySetResult();
+            await WaitUntil(() => !model.IsTesting);
+
+            Require(!model.CaptureSetupVerified,
+                "A Test result must not verify a source that changed while the worker was running.");
+            Require(model.Assessment.Contains("changed on disk", StringComparison.Ordinal),
+                "The post-Test source change should remain visible.");
+            Equal(StatusKind.Error, model.StatusKind);
+        }
+
+        using (var fixture = new Fixture())
+        {
+            using var model = fixture.CreateModel();
+            await model.InitializeAsync();
+            model.ChooseSourceCommand.Execute(null);
+            model.TestCommand.Execute(null);
+            await WaitUntil(() => model.CanCapture);
+            fixture.Worker.HoldCaptureCompletion = true;
+
+            model.CaptureCommand.Execute(null);
+            await fixture.Worker.CaptureOutputWritten.Task.WaitAsync(TimeSpan.FromSeconds(2));
+            MutateWavPayload(fixture.SourcePath);
+            fixture.Worker.ReleaseCaptureCompletion.TrySetResult();
+            await WaitUntil(() => !model.IsCapturing);
+
+            Require(!File.Exists(fixture.DestinationPath),
+                "A capture must not be promoted when its source changed during the worker operation.");
+            Require(!model.CanCapture,
+                "A mid-Capture source change must invalidate the previous setup verification.");
+            Require(model.Assessment.Contains("changed on disk", StringComparison.Ordinal),
+                "The post-Capture source change should remain visible.");
+            Require(!Directory.EnumerateFiles(fixture.DirectoryPath, ".capture-panel-*.tmp.wav").Any(),
+                "A discarded stale capture should remove its temporary output.");
+        }
+    }
+
+    private static void MutateWavPayload(string path)
+    {
+        var bytes = File.ReadAllBytes(path);
+        Require(bytes.Length > 44, "The source fixture has no audio payload to mutate.");
+        bytes[44] ^= 0x01;
+        File.WriteAllBytes(path, bytes);
+    }
+
+    private static async Task CaptureCannotOverwriteSource()
+    {
+        using var fixture = new Fixture();
+        var dialogs = new FakeFileDialogService(fixture.SourcePath, fixture.SourcePath);
+        using var model = new MainViewModel(
+            fixture.Worker,
+            fixture.Settings,
+            dialogs,
+            showDevelopmentDevices: true);
+        await model.InitializeAsync();
+        model.ChooseSourceCommand.Execute(null);
+        model.TestCommand.Execute(null);
+        await WaitUntil(() => model.CanCapture);
+
+        var originalLength = new FileInfo(fixture.SourcePath).Length;
+        model.CaptureCommand.Execute(null);
+        await WaitUntil(() => model.Assessment.Contains("must not overwrite", StringComparison.Ordinal));
+
+        Equal(0, fixture.Worker.CaptureCalls);
+        Equal(originalLength, new FileInfo(fixture.SourcePath).Length);
+        Equal(480L, WavMetadataReader.Read(fixture.SourcePath).Frames);
+        Require(model.CanCapture, "A rejected destination should preserve the verified audio route.");
+        Equal(StatusKind.Error, model.StatusKind);
+
+        using var hardLinkFixture = new Fixture();
+        var hardLinkPath = Path.Combine(hardLinkFixture.DirectoryPath, "source-hard-link.wav");
+        if (!CreateHardLink(hardLinkPath, hardLinkFixture.SourcePath, IntPtr.Zero))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not create the hard-link test fixture.");
+        }
+        var hardLinkDialogs = new FakeFileDialogService(hardLinkFixture.SourcePath, hardLinkPath);
+        using var hardLinkModel = new MainViewModel(
+            hardLinkFixture.Worker,
+            hardLinkFixture.Settings,
+            hardLinkDialogs,
+            showDevelopmentDevices: true);
+        await hardLinkModel.InitializeAsync();
+        hardLinkModel.ChooseSourceCommand.Execute(null);
+        hardLinkModel.TestCommand.Execute(null);
+        await WaitUntil(() => hardLinkModel.CanCapture);
+        hardLinkModel.CaptureCommand.Execute(null);
+        await WaitUntil(() => hardLinkModel.Assessment.Contains("must not overwrite", StringComparison.Ordinal));
+        Equal(0, hardLinkFixture.Worker.CaptureCalls);
+    }
+
+    private static async Task InconsistentSetupResultIsRejected()
+    {
+        using (var fixture = new Fixture())
+        {
+            fixture.Worker.TestResult = fixture.Worker.TestResult with
+            {
+                Passed = true,
+                Failures = [new DiagnosticInfo("digital_clipping", "Clipping was detected.")],
+            };
+            using var model = fixture.CreateModel();
+            await model.InitializeAsync();
+            model.ChooseSourceCommand.Execute(null);
+            model.TestCommand.Execute(null);
+            await WaitUntil(() => fixture.Worker.TestCalls == 1 && !model.IsTesting);
+
+            Require(!model.CanCapture, "Failures must win over an inconsistent passed flag.");
+            Equal(StatusKind.Error, model.StatusKind);
+            Require(model.Assessment.Contains("disagrees", StringComparison.Ordinal),
+                "The inconsistent result should be reported as a protocol failure.");
+        }
+
+        using (var fixture = new Fixture())
+        {
+            fixture.Worker.TestResult = fixture.Worker.TestResult with { SampleRate = double.NaN };
+            using var model = fixture.CreateModel();
+            await model.InitializeAsync();
+            model.ChooseSourceCommand.Execute(null);
+            model.TestCommand.Execute(null);
+            await WaitUntil(() => fixture.Worker.TestCalls == 1 && !model.IsTesting);
+            Require(!model.CanCapture, "Non-finite setup measurements must fail closed.");
+        }
+    }
+
     private static async Task CapturePromotesTemporaryOutput()
     {
         using var fixture = new Fixture();
@@ -180,10 +460,79 @@ internal static class Program
         Require(model.CanCapture, "A successful capture should preserve the verified setup.");
     }
 
+    private static async Task CaptureWarningsRemainVisible()
+    {
+        using var fixture = new Fixture();
+        fixture.Worker.CaptureWarnings =
+        [
+            new DiagnosticInfo(
+                "source_near_digital_full_scale",
+                "The source is at or near digital full scale."),
+        ];
+        using var model = fixture.CreateModel();
+        await model.InitializeAsync();
+        model.ChooseSourceCommand.Execute(null);
+        model.TestCommand.Execute(null);
+        await WaitUntil(() => model.CanCapture);
+
+        model.CaptureCommand.Execute(null);
+        await WaitUntil(() => fixture.Worker.CaptureCalls == 1 && !model.IsCapturing);
+
+        Equal(StatusKind.Warning, model.StatusKind);
+        Equal("Saved with Warning", model.StatusTitle);
+        Require(model.StatusMessage.Contains("digital full scale", StringComparison.Ordinal),
+            "A successful capture warning must remain visible in the status card.");
+        Require(model.CanCapture, "A capture warning should not invalidate a verified route.");
+    }
+
+    private static async Task InvalidCaptureResultsAreRejected()
+    {
+        var configureCases = new Action<FakeWorkerClient>[]
+        {
+            worker => worker.WriteCorruptCapture = true,
+            worker => worker.CaptureFileSizeAdjustment = 1,
+            worker => worker.CaptureResultPath = Path.Combine(Path.GetTempPath(), "wrong-capture.wav"),
+            worker => worker.CaptureResultChannels = 2,
+            worker =>
+            {
+                worker.CaptureFileChannels = 2;
+                worker.CaptureResultChannels = 2;
+            },
+            worker =>
+            {
+                worker.CaptureFileBitDepth = 16;
+                worker.CaptureResultBitDepth = 16;
+            },
+        };
+
+        foreach (var configure in configureCases)
+        {
+            using var fixture = new Fixture();
+            configure(fixture.Worker);
+            using var model = fixture.CreateModel();
+            await model.InitializeAsync();
+            model.ChooseSourceCommand.Execute(null);
+            model.TestCommand.Execute(null);
+            await WaitUntil(() => model.CanCapture);
+
+            model.CaptureCommand.Execute(null);
+            await WaitUntil(() => fixture.Worker.CaptureCalls == 1 && !model.IsCapturing);
+
+            Require(!File.Exists(fixture.DestinationPath),
+                "An invalid worker result must never be promoted.");
+            Require(!model.CanCapture, "Invalid output must invalidate the worker result.");
+            Require(model.Assessment.StartsWith("Capture failed:", StringComparison.Ordinal),
+                "Invalid output should produce a visible capture failure.");
+            Require(!Directory.EnumerateFiles(fixture.DirectoryPath, ".capture-panel-*.tmp.wav").Any(),
+                "Invalid temporary output should be removed.");
+        }
+    }
+
     private static async Task LateCaptureCompletionStaysCancelled()
     {
         using var fixture = new Fixture();
         fixture.Worker.HoldCaptureCompletion = true;
+        fixture.Worker.CreateNativeSiblingTemporary = true;
         using var model = fixture.CreateModel();
         await model.InitializeAsync();
         model.ChooseSourceCommand.Execute(null);
@@ -195,10 +544,17 @@ internal static class Program
         model.CaptureCommand.Execute(null);
         fixture.Worker.ReleaseCaptureCompletion.TrySetResult();
         await WaitUntil(() => !model.IsCapturing);
+        await Task.Delay(100);
 
         Require(!File.Exists(fixture.DestinationPath),
             "A cancelled capture must never promote a late temporary result.");
+        Require(!Directory.EnumerateFiles(fixture.DirectoryPath).Any(path =>
+                Path.GetFileName(path).Contains(".capture-panel.tmp.", StringComparison.Ordinal)),
+            "A cancelled native atomic write must not leave its inner sibling temp behind.");
         Equal("Capture cancelled.", model.Assessment);
+        Equal("Cancelled", model.ProgressLabel);
+        Require(model.ProgressFraction is null,
+            "Queued progress from a cancelled worker must not revive the progress bar.");
         Require(model.CanCapture, "Cancellation should preserve the previously verified route.");
     }
 
@@ -220,6 +576,32 @@ internal static class Program
         Require(model.StatusMessage.Contains("disconnected", StringComparison.Ordinal),
             "The capture failure should remain visible in the status region.");
         Equal(model.StatusMessage, model.VerificationFooterText);
+    }
+
+    private static async Task CaptureCancellationWinsConcurrentWorkerError()
+    {
+        using var fixture = new Fixture();
+        fixture.Worker.CaptureCancellationRaceException =
+            new IOException("The ASIO driver failed while the worker was stopping.");
+        using var model = fixture.CreateModel();
+        await model.InitializeAsync();
+        model.ChooseSourceCommand.Execute(null);
+        model.TestCommand.Execute(null);
+        await WaitUntil(() => model.CanCapture);
+
+        model.CaptureCommand.Execute(null);
+        await WaitUntil(() => fixture.Worker.CaptureCalls == 1 && model.IsCapturing);
+        model.CaptureCommand.Execute(null);
+        await WaitUntil(() => !model.IsCapturing);
+
+        Equal("Cancelled", model.ProgressLabel);
+        Equal("Capture cancelled.", model.Assessment);
+        Require(model.CanCapture,
+            "A worker teardown error after cancellation must preserve the verified route.");
+        Require(!File.Exists(fixture.DestinationPath),
+            "A cancellation/error race must not promote an output file.");
+        Require(model.RecoveryOutputPath is null,
+            "An unvalidated cancellation/error race must not expose a recovery output.");
     }
 
     private static async Task StaleChannelDiscoveryIsIgnored()
@@ -346,7 +728,7 @@ internal static class Program
         return Task.CompletedTask;
     }
 
-    private static Task WavMetadataRoundTrip()
+    private static async Task WavMetadataRoundTrip()
     {
         using var fixture = new Fixture();
         var metadata = WavMetadataReader.Read(fixture.SourcePath);
@@ -354,6 +736,53 @@ internal static class Program
         Equal(1, metadata.Channels);
         Equal(24, metadata.BitsPerSample);
         Equal(480L, metadata.Frames);
+
+        var metadataOnly = WavMetadataReader.ReadMetadataSnapshot(fixture.SourcePath);
+        Equal(string.Empty, metadataOnly.ContentSha256);
+        var fingerprinted = await WavMetadataReader.ReadSnapshotAsync(
+            fixture.SourcePath,
+            CancellationToken.None);
+        Equal(64, fingerprinted.ContentSha256.Length);
+        Equal(metadataOnly.Metadata, fingerprinted.Metadata);
+
+        using var cancelled = new CancellationTokenSource();
+        cancelled.Cancel();
+        await ExpectThrowsAsync<OperationCanceledException>(
+            () => WavMetadataReader.ReadSnapshotAsync(fixture.SourcePath, cancelled.Token));
+    }
+
+    private static Task WavMetadataRejectsMalformedFiles()
+    {
+        using var fixture = new Fixture();
+
+        var blockAlignPath = Path.Combine(fixture.DirectoryPath, "bad-block-align.wav");
+        var blockAlignBytes = File.ReadAllBytes(fixture.SourcePath);
+        blockAlignBytes[32] = 2;
+        blockAlignBytes[33] = 0;
+        File.WriteAllBytes(blockAlignPath, blockAlignBytes);
+        ExpectThrows<InvalidDataException>(() => WavMetadataReader.Read(blockAlignPath));
+
+        var partialFramePath = Path.Combine(fixture.DirectoryPath, "partial-frame.wav");
+        var partialFrameBytes = File.ReadAllBytes(fixture.SourcePath);
+        BitConverter.GetBytes(1_439).CopyTo(partialFrameBytes, 40);
+        File.WriteAllBytes(partialFramePath, partialFrameBytes);
+        ExpectThrows<InvalidDataException>(() => WavMetadataReader.Read(partialFramePath));
+
+        var badExtensiblePath = Path.Combine(fixture.DirectoryPath, "bad-extensible.wav");
+        Fixture.WriteExtensiblePcm24Wav(badExtensiblePath, validGuid: false);
+        ExpectThrows<InvalidDataException>(() => WavMetadataReader.Read(badExtensiblePath));
+
+        var validExtensiblePath = Path.Combine(fixture.DirectoryPath, "valid-extensible.wav");
+        Fixture.WriteExtensiblePcm24Wav(validExtensiblePath, validGuid: true);
+        Equal(1L, WavMetadataReader.Read(validExtensiblePath).Frames);
+
+        var emptyPath = Path.Combine(fixture.DirectoryPath, "empty.wav");
+        Fixture.WritePcmWav(emptyPath, sampleRate: 48_000, frames: 0);
+        ExpectThrows<InvalidDataException>(() => WavMetadataReader.Read(emptyPath));
+
+        var unsupportedRatePath = Path.Combine(fixture.DirectoryPath, "unsupported-rate.wav");
+        Fixture.WritePcmWav(unsupportedRatePath, sampleRate: 800, frames: 1);
+        ExpectThrows<InvalidDataException>(() => WavMetadataReader.ReadSnapshot(unsupportedRatePath));
         return Task.CompletedTask;
     }
 
@@ -375,6 +804,14 @@ internal static class Program
         Require(testResult.Passed, "The native Fake setup test should pass.");
         Equal("reliable", testResult.Reliability);
 
+        var clippingResult = await worker.TestAsync(
+            new SetupTestRequest("fake:loopback", 1, 1, 0, 12, 48_000),
+            progress: null,
+            timeout.Token);
+        Require(!clippingResult.Passed
+                && clippingResult.Failures.Any(failure => failure.Code == "digital_clipping"),
+            "The worker client must accept the documented exit code for a valid failed Test result.");
+
         var outputPath = Path.Combine(fixture.DirectoryPath, "native-capture.wav");
         var captureResult = await worker.CaptureAsync(
             new CaptureRequest(fixture.SourcePath, outputPath, "fake:loopback", 1, 1, 0, 0),
@@ -383,6 +820,80 @@ internal static class Program
         Require(File.Exists(outputPath), "The native Fake capture did not write an output WAV.");
         Equal(Path.GetFullPath(outputPath), Path.GetFullPath(captureResult.OutputPath));
         Equal(480L, WavMetadataReader.Read(outputPath).Frames);
+    }
+
+    private static async Task WorkerClientSerializesAndCancels()
+    {
+        var helperPath = Path.Combine(AppContext.BaseDirectory, "CapturePanel.App.Tests.exe");
+        Require(File.Exists(helperPath), "The managed worker helper apphost is missing.");
+        var worker = new CaptureWorkerClient(helperPath);
+
+        try
+        {
+            Environment.SetEnvironmentVariable("CAPTURE_PANEL_TEST_WORKER_MODE", "serial");
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            await Task.WhenAll(
+                worker.GetDevicesAsync(CancellationToken.None),
+                worker.GetDevicesAsync(CancellationToken.None));
+            stopwatch.Stop();
+            Require(stopwatch.Elapsed >= TimeSpan.FromMilliseconds(500),
+                "One CaptureWorkerClient must never overlap native worker processes.");
+
+            Environment.SetEnvironmentVariable("CAPTURE_PANEL_TEST_WORKER_MODE", "hang");
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+            stopwatch.Restart();
+            await ExpectThrowsAsync<OperationCanceledException>(
+                () => worker.GetDevicesAsync(cancellation.Token));
+            stopwatch.Stop();
+            Require(stopwatch.Elapsed < TimeSpan.FromSeconds(5),
+                "Cancelling a hung native worker must complete within the bounded cleanup window.");
+
+            Environment.SetEnvironmentVariable("CAPTURE_PANEL_TEST_WORKER_MODE", "inconsistent-test");
+            CaptureWorkerException? protocolError = null;
+            try
+            {
+                _ = await worker.TestAsync(
+                    new SetupTestRequest("fake:loopback", 1, 1, 0, 0, 48_000),
+                    progress: null,
+                    CancellationToken.None);
+            }
+            catch (CaptureWorkerException exception)
+            {
+                protocolError = exception;
+            }
+            Equal("protocol_error", protocolError?.Code);
+
+            Environment.SetEnvironmentVariable("CAPTURE_PANEL_TEST_WORKER_MODE", "failed-test-exit-zero");
+            protocolError = null;
+            try
+            {
+                _ = await worker.TestAsync(
+                    new SetupTestRequest("fake:loopback", 1, 1, 0, 0, 48_000),
+                    progress: null,
+                    CancellationToken.None);
+            }
+            catch (CaptureWorkerException exception)
+            {
+                protocolError = exception;
+            }
+            Equal("protocol_error", protocolError?.Code);
+
+            Environment.SetEnvironmentVariable("CAPTURE_PANEL_TEST_WORKER_MODE", "capture-warning");
+            using var fixture = new Fixture();
+            var helperOutput = Path.Combine(fixture.DirectoryPath, "helper-output.wav");
+            var capture = await worker.CaptureAsync(
+                new CaptureRequest(fixture.SourcePath, helperOutput, "fake:loopback", 1, 1, 0, 0),
+                progress: null,
+                CancellationToken.None);
+            Equal(1, capture.Warnings.Count);
+            Equal("source_near_digital_full_scale", capture.Warnings[0].Code);
+            Require(capture.Warnings[0].Message.Contains("selected source", StringComparison.Ordinal),
+                "Capture warning collection should preserve the detailed event message.");
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CAPTURE_PANEL_TEST_WORKER_MODE", null);
+        }
     }
 
     private static Task WindowsFluentViewsLoad()
@@ -585,6 +1096,39 @@ internal static class Program
             throw new InvalidOperationException($"Expected '{expected}', received '{actual}'.");
         }
     }
+
+    private static void ExpectThrows<TException>(Action action) where TException : Exception
+    {
+        try
+        {
+            action();
+        }
+        catch (TException)
+        {
+            return;
+        }
+        throw new InvalidOperationException($"Expected {typeof(TException).Name}.");
+    }
+
+    private static async Task ExpectThrowsAsync<TException>(Func<Task> action) where TException : Exception
+    {
+        try
+        {
+            await action();
+        }
+        catch (TException)
+        {
+            return;
+        }
+        throw new InvalidOperationException($"Expected {typeof(TException).Name}.");
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CreateHardLink(
+        string fileName,
+        string existingFileName,
+        IntPtr securityAttributes);
 }
 
 internal sealed class Fixture : IDisposable
@@ -595,7 +1139,7 @@ internal sealed class Fixture : IDisposable
         Directory.CreateDirectory(DirectoryPath);
         SourcePath = Path.Combine(DirectoryPath, "source.wav");
         DestinationPath = Path.Combine(DirectoryPath, "source-captured.wav");
-        WritePcm24Wav(SourcePath, sampleRate: 48_000, frames: 480);
+        WritePcmWav(SourcePath, sampleRate: 48_000, frames: 480);
         Worker = new FakeWorkerClient();
         Dialogs = new FakeFileDialogService(SourcePath, DestinationPath);
         Settings = new MemorySettingsStore();
@@ -619,11 +1163,22 @@ internal sealed class Fixture : IDisposable
         }
     }
 
-    private static void WritePcm24Wav(string path, int sampleRate, int frames)
+    internal static void WritePcmWav(
+        string path,
+        int sampleRate,
+        int frames,
+        short channels = 1,
+        short bitDepth = 24)
     {
-        const short channels = 1;
-        const short bits = 24;
-        const short blockAlign = channels * (bits / 8);
+        if (channels <= 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(channels));
+        }
+        if (bitDepth is not (16 or 24 or 32))
+        {
+            throw new ArgumentOutOfRangeException(nameof(bitDepth));
+        }
+        var blockAlign = checked((short)(channels * (bitDepth / 8)));
         var dataBytes = frames * blockAlign;
         using var stream = File.Create(path);
         using var writer = new BinaryWriter(stream);
@@ -637,10 +1192,41 @@ internal sealed class Fixture : IDisposable
         writer.Write(sampleRate);
         writer.Write(sampleRate * blockAlign);
         writer.Write(blockAlign);
-        writer.Write(bits);
+        writer.Write(bitDepth);
         writer.Write("data"u8.ToArray());
         writer.Write(dataBytes);
         writer.Write(new byte[dataBytes]);
+    }
+
+    internal static void WriteExtensiblePcm24Wav(string path, bool validGuid)
+    {
+        const short channels = 1;
+        const short bits = 24;
+        const short blockAlign = channels * (bits / 8);
+        using var stream = File.Create(path);
+        using var writer = new BinaryWriter(stream);
+        writer.Write("RIFF"u8.ToArray());
+        writer.Write(64);
+        writer.Write("WAVE"u8.ToArray());
+        writer.Write("fmt "u8.ToArray());
+        writer.Write(40);
+        writer.Write(unchecked((short)0xFFFE));
+        writer.Write(channels);
+        writer.Write(48_000);
+        writer.Write(48_000 * blockAlign);
+        writer.Write(blockAlign);
+        writer.Write(bits);
+        writer.Write((short)22);
+        writer.Write(bits);
+        writer.Write(0);
+        writer.Write(1);
+        writer.Write(validGuid
+            ? new byte[] { 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71 }
+            : new byte[12]);
+        writer.Write("data"u8.ToArray());
+        writer.Write(3);
+        writer.Write(new byte[3]);
+        writer.Write((byte)0);
     }
 }
 
@@ -651,10 +1237,23 @@ internal sealed class FakeWorkerClient : ICaptureWorkerClient
     public int TestCalls { get; private set; }
     public int CaptureCalls { get; private set; }
     public Exception? CaptureException { get; set; }
+    public Exception? CaptureCancellationRaceException { get; set; }
     public bool HangTest { get; set; }
+    public bool HoldTestCompletion { get; set; }
     public bool HoldCaptureCompletion { get; set; }
+    public bool WriteCorruptCapture { get; set; }
+    public bool CreateNativeSiblingTemporary { get; set; }
+    public long CaptureFileSizeAdjustment { get; set; }
+    public string? CaptureResultPath { get; set; }
+    public short CaptureFileChannels { get; set; } = 1;
+    public short CaptureFileBitDepth { get; set; } = 24;
+    public int CaptureResultChannels { get; set; } = 1;
+    public int CaptureResultBitDepth { get; set; } = 24;
+    public IReadOnlyList<DiagnosticInfo> CaptureWarnings { get; set; } = [];
     public TaskCompletionSource CaptureOutputWritten { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     public TaskCompletionSource ReleaseCaptureCompletion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public TaskCompletionSource TestStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public TaskCompletionSource ReleaseTestCompletion { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     public SetupTestResult TestResult { get; set; } = new(
         Passed: true,
         SampleRate: 48_000,
@@ -686,9 +1285,14 @@ internal sealed class FakeWorkerClient : ICaptureWorkerClient
         CancellationToken cancellationToken)
     {
         TestCalls++;
+        TestStarted.TrySetResult();
         if (HangTest)
         {
             await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+        }
+        if (HoldTestCompletion)
+        {
+            await ReleaseTestCompletion.Task.WaitAsync(cancellationToken);
         }
         progress?.Report(new WorkerProgress("recording", 0.5, 1));
         progress?.Report(new WorkerProgress("verification", 1));
@@ -701,29 +1305,62 @@ internal sealed class FakeWorkerClient : ICaptureWorkerClient
         CancellationToken cancellationToken)
     {
         CaptureCalls++;
+        if (CaptureCancellationRaceException is { } cancellationRaceException)
+        {
+            try
+            {
+                await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw cancellationRaceException;
+            }
+        }
         if (CaptureException is not null)
         {
             throw CaptureException;
         }
         progress?.Report(new WorkerProgress("recording", 0.5, 1));
-        await File.WriteAllBytesAsync(request.OutputPath, [1, 2, 3], cancellationToken);
+        if (WriteCorruptCapture)
+        {
+            await File.WriteAllBytesAsync(request.OutputPath, [1, 2, 3], cancellationToken);
+        }
+        else
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            Fixture.WritePcmWav(
+                request.OutputPath,
+                sampleRate: 48_000,
+                frames: 480,
+                channels: CaptureFileChannels,
+                bitDepth: CaptureFileBitDepth);
+        }
+        if (CreateNativeSiblingTemporary)
+        {
+            await File.WriteAllBytesAsync(
+                request.OutputPath + ".capture-panel.tmp.999.0",
+                [1, 2, 3],
+                CancellationToken.None);
+        }
         CaptureOutputWritten.TrySetResult();
         if (HoldCaptureCompletion)
         {
             await ReleaseCaptureCompletion.Task;
         }
         progress?.Report(new WorkerProgress("complete", 1));
+        var fileSize = new FileInfo(request.OutputPath).Length;
         return new CaptureCompleted(
-            request.OutputPath,
-            3,
-            1,
-            24,
+            CaptureResultPath ?? request.OutputPath,
+            fileSize + CaptureFileSizeAdjustment,
+            CaptureResultChannels,
+            CaptureResultBitDepth,
             48_000,
             0.1,
             60,
             1.25,
             480,
-            480);
+            480,
+            CaptureWarnings);
     }
 }
 

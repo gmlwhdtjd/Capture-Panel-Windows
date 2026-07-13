@@ -25,7 +25,10 @@ Studio WPF tooling.
 ```
 
 `build.ps1` uses CMake from `PATH` when available and otherwise locates the
-Visual Studio bundled CMake through `vswhere`. It always builds in this order:
+Visual Studio bundled CMake through `vswhere`. The script resolves presets,
+`global.json`, projects, and outputs relative to the repository, so it can also
+be invoked by absolute path from another current directory. It always builds in
+this order:
 
 1. configure and build the x64 native C++ targets;
 2. run the native CTest suite when `-Test` is present;
@@ -34,7 +37,9 @@ Visual Studio bundled CMake through `vswhere`. It always builds in this order:
 
 The managed tests primarily use an in-process Fake worker and also exercise the
 native JSON worker contract through `fake:loopback`; they do not open an ASIO
-driver.
+driver. They also launch a controlled helper process to verify worker
+serialization, Job Object cancellation bounds, exit-code/result invariants,
+warning propagation, and malformed-result rejection.
 
 Release validation:
 
@@ -88,6 +93,8 @@ drivers are never copied into build or publish output.
 - Put platform-independent behavior in `capture_panel_core`.
 - Add Windows/ASIO code only under `src/backends/asio`.
 - Keep the Fake backend behavior deterministic.
+- Keep arbitrary-duration capture paths chunked; whole-file `AudioBuffer`
+  materialization is reserved for bounded test and setup-verification fixtures.
 - Keep the WPF/native boundary on the versioned JSON Lines worker protocol.
 - Keep `capture-panel.exe` adjacent to `CapturePanel.exe` in build and publish output.
 - Do not allocate, lock, log, perform file I/O, or call managed code from an ASIO callback.
@@ -99,8 +106,9 @@ drivers are never copied into build or publish output.
 ## Test boundaries
 
 The normal CTest suite does not open an ASIO driver. It validates the core,
-Fake backend, ASIO sample conversion, buffer timeline, device-ID parsing,
-backend routing, CLI, and JSON worker output. The managed test executable
+streaming WAV/Float32 assets, SPSC ring and stream workers, Fake backend, ASIO
+sample conversion, buffer timeline, device-ID parsing, backend routing, CLI,
+and JSON worker output. The managed test executable
 validates WPF view-model state, settings, WAV metadata, capture-file promotion,
 and the native JSON worker contract with `fake:loopback`. Native driver
 callbacks and physical routing use the protected manual procedure in

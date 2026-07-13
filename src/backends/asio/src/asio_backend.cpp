@@ -3,6 +3,7 @@
 #include "asio_backend_helpers.hpp"
 #include "asio_driver_registry.hpp"
 #include "asio_driver_session.hpp"
+#include "asio_session_gate.hpp"
 #include "capture_panel/core/errors.hpp"
 
 #define WIN32_LEAN_AND_MEAN
@@ -154,6 +155,7 @@ void require_asio_result(
 }
 
 std::vector<AudioDevice> AsioAudioBackend::devices() const {
+    const auto session_lease = acquire_asio_session();
     const auto registrations = enumerate_asio_drivers();
     std::vector<AudioDevice> result;
     result.reserve(registrations.size());
@@ -164,12 +166,14 @@ std::vector<AudioDevice> AsioAudioBackend::devices() const {
 }
 
 AudioDevice AsioAudioBackend::device(const std::string& id) const {
+    const auto session_lease = acquire_asio_session();
     return probe_driver(find_asio_driver(id));
 }
 
 std::vector<AudioChannel> AsioAudioBackend::channels(
     const std::string& id,
     const ChannelDirection direction) const {
+    const auto session_lease = acquire_asio_session();
     const auto registration = find_asio_driver(id);
     AsioDriverSession session(registration);
     const auto capabilities = query_capabilities(session);
@@ -201,6 +205,7 @@ std::vector<AudioChannel> AsioAudioBackend::channels(
 void AsioAudioBackend::set_sample_rate(
     const std::string& id,
     const double sample_rate) {
+    const auto session_lease = acquire_asio_session();
     if (!std::isfinite(sample_rate) || sample_rate <= 0.0) {
         throw CaptureError(
             ErrorCode::unsupported_sample_rate,

@@ -2,8 +2,11 @@
 
 #include "asio_backend_helpers.hpp"
 #include "asio_buffer_timeline.hpp"
+#include "asio_callback_lifetime.hpp"
 #include "asio_driver_session.hpp"
 #include "asio_sample_converter.hpp"
+#include "asio_session_gate.hpp"
+#include "asio_stream_workers.hpp"
 #include "capture_panel/core/channels.hpp"
 #include "capture_panel/core/errors.hpp"
 
@@ -56,7 +59,7 @@ namespace {
             ErrorCode::validation_failed,
             "ASIO capture padding must be a non-negative finite value.");
     }
-    const auto frames = request.padding_seconds * request.playback.sample_rate;
+    const auto frames = request.padding_seconds * request.playback_plan.sample_rate();
     if (!std::isfinite(frames)
         || frames >= static_cast<double>(std::numeric_limits<std::int64_t>::max())) {
         throw CaptureError(ErrorCode::validation_failed, "ASIO capture padding is too large.");
@@ -64,21 +67,18 @@ namespace {
     return static_cast<std::int64_t>(std::llround(frames));
 }
 
-void validate_playback_buffer(const AudioBuffer& playback) {
-    if (!std::isfinite(playback.sample_rate) || playback.sample_rate <= 0.0) {
+void validate_playback_plan(const CapturePassPlaybackPlan& playback) {
+    if (!playback.source.valid() || !std::isfinite(playback.sample_rate())
+        || playback.sample_rate() <= 0.0) {
         throw CaptureError(
             ErrorCode::unsupported_sample_rate,
             "ASIO playback sample rate must be a positive finite value.");
     }
-    if (playback.channel_count == 0 || playback.frame_count() <= 0) {
+    if (playback.channel_count() == 0 || playback.playback_frame_count <= 0
+        || playback.source.format().total_frames <= 0) {
         throw CaptureError(
             ErrorCode::validation_failed,
             "ASIO playback audio must contain at least one frame and channel.");
-    }
-    if (playback.samples.size() % playback.channel_count != 0) {
-        throw CaptureError(
-            ErrorCode::validation_failed,
-            "ASIO playback audio is not frame-aligned.");
     }
 }
 
@@ -174,14 +174,18 @@ void configure_sample_rate(IASIO& driver, const double requested) {
 
 struct CaptureState final {
     IASIO* driver = nullptr;
-    const AudioBuffer* playback = nullptr;
-    AudioBuffer* recorded = nullptr;
+    AsioStreamWorkers* streams = nullptr;
     std::vector<ASIOBufferInfo>* buffer_infos = nullptr;
     const std::vector<ASIOChannelInfo>* output_info = nullptr;
     const std::vector<ASIOChannelInfo>* input_info = nullptr;
     std::int64_t padding_frame_count = 0;
+    std::int64_t playback_frame_count = 0;
+    std::int64_t playback_frames_consumed = 0;
+    std::size_t playback_channel_count = 0;
     std::size_t buffer_frame_count = 0;
+    std::vector<float> playback_scratch;
     std::vector<float> output_scratch;
+    std::vector<float> input_scratch;
     std::vector<MutableAsioChannelBuffer> output_views;
     std::vector<ConstAsioChannelBuffer> input_views;
     std::vector<std::size_t> output_byte_counts;
@@ -202,8 +206,8 @@ struct CaptureState final {
 
     CaptureState(
         IASIO& asio_driver,
-        const AudioBuffer& source,
-        AudioBuffer& destination,
+        const CapturePassPlaybackPlan& playback,
+        AsioStreamWorkers& stream_workers,
         std::vector<ASIOBufferInfo>& buffers,
         const std::vector<ASIOChannelInfo>& outputs,
         const std::vector<ASIOChannelInfo>& inputs,
@@ -211,18 +215,31 @@ struct CaptureState final {
         const std::int64_t total_frames_value,
         const long asio_buffer_size)
         : driver(&asio_driver),
-          playback(&source),
-          recorded(&destination),
+          streams(&stream_workers),
           buffer_infos(&buffers),
           output_info(&outputs),
           input_info(&inputs),
           padding_frame_count(padding_frames_value),
+          playback_frame_count(playback.playback_frame_count),
+          playback_channel_count(playback.channel_count()),
           buffer_frame_count(static_cast<std::size_t>(asio_buffer_size)),
+          playback_scratch(
+              checked_sample_count(
+                  asio_buffer_size,
+                  playback.channel_count(),
+                  "ASIO callback source"),
+              0.0F),
           output_scratch(
               checked_sample_count(
                   asio_buffer_size,
                   outputs.size(),
                   "ASIO callback playback"),
+              0.0F),
+          input_scratch(
+              checked_sample_count(
+                  asio_buffer_size,
+                  inputs.size(),
+                  "ASIO callback recording"),
               0.0F),
           output_views(outputs.size()),
           input_views(inputs.size()),
@@ -247,20 +264,33 @@ struct CaptureState final {
         const auto output_channels = output_info->size();
 
         std::fill(output_scratch.begin(), output_scratch.end(), 0.0F);
-        for (std::size_t frame = 0; frame < block.frame_count; ++frame) {
-            const auto capture_frame = block.start_frame
-                + static_cast<std::int64_t>(frame);
-            const auto playback_frame = capture_frame - padding_frame_count;
-            if (playback_frame < 0 || playback_frame >= playback->frame_count()) continue;
-            const auto mapped_channels = std::min<std::size_t>(
-                output_channels,
-                playback->channel_count);
-            for (std::size_t channel = 0; channel < mapped_channels; ++channel) {
-                const auto source_index = static_cast<std::size_t>(playback_frame)
-                        * playback->channel_count
-                    + channel;
-                output_scratch[frame * output_channels + channel]
-                    = playback->samples[source_index];
+        const auto block_end = block.start_frame + static_cast<std::int64_t>(block.frame_count);
+        const auto playback_start = padding_frame_count;
+        const auto playback_end = playback_start + playback_frame_count;
+        const auto overlap_start = std::max(block.start_frame, playback_start);
+        const auto overlap_end = std::min(block_end, playback_end);
+        if (overlap_end > overlap_start) {
+            const auto overlap_frames = static_cast<std::size_t>(overlap_end - overlap_start);
+            const auto source_samples = overlap_frames * playback_channel_count;
+            if (!streams->playback_ring().read_exact(
+                    std::span<float>(playback_scratch).first(source_samples))) {
+                streams->fail_playback_underflow();
+            } else {
+                const auto destination_frame = static_cast<std::size_t>(
+                    overlap_start - block.start_frame);
+                const auto mapped_channels = std::min(
+                    output_channels,
+                    playback_channel_count);
+                for (std::size_t frame = 0; frame < overlap_frames; ++frame) {
+                    for (std::size_t channel = 0; channel < mapped_channels; ++channel) {
+                        output_scratch[(destination_frame + frame) * output_channels + channel]
+                            = playback_scratch[frame * playback_channel_count + channel];
+                    }
+                }
+                playback_frames_consumed += static_cast<std::int64_t>(overlap_frames);
+                if (playback_frames_consumed >= playback_frame_count) {
+                    streams->mark_playback_consumed();
+                }
             }
         }
 
@@ -294,15 +324,19 @@ struct CaptureState final {
             };
         }
 
-        const auto destination_offset = static_cast<std::size_t>(start_frame)
-            * input_channels;
+        static_cast<void>(start_frame);
         const auto destination_size = frames * input_channels;
-        return asio_to_interleaved_float(
+        const auto converted = asio_to_interleaved_float(
             input_views,
             frames,
-            std::span<float>(recorded->samples).subspan(
-                destination_offset,
-                destination_size)) == SampleConversionResult::success;
+            std::span<float>(input_scratch).first(destination_size))
+            == SampleConversionResult::success;
+        if (!converted) return false;
+        if (!streams->recording_ring().write_exact(
+                std::span<const float>(input_scratch).first(destination_size))) {
+            streams->fail_recording_overflow();
+        }
+        return true;
     }
 
     [[nodiscard]] bool prime_output() noexcept {
@@ -345,7 +379,13 @@ struct CaptureState final {
         if (!conversion_ok) {
             conversion_failed.store(true, std::memory_order_release);
             should_finish = true;
+        } else if (streams->failed()) {
+            should_finish = true;
         } else if (timeline.recording_complete()) {
+            if (!streams->playback_consumed()) {
+                streams->fail_playback_underflow();
+            }
+            streams->mark_recording_producer_finished();
             should_finish = true;
         }
         should_finish = should_finish
@@ -359,22 +399,23 @@ struct CaptureState final {
     }
 };
 
-static_assert(std::atomic<CaptureState*>::is_always_lock_free);
 static_assert(std::atomic<std::int64_t>::is_always_lock_free);
+static_assert(std::atomic_bool::is_always_lock_free);
+static_assert(std::atomic<AsioStreamFailure>::is_always_lock_free);
 
-std::atomic<CaptureState*> active_capture{nullptr};
+CallbackLifetimeGate<CaptureState> active_capture;
 
 void buffer_switch(const long double_buffer_index, const ASIOBool direct_process) noexcept {
     static_cast<void>(direct_process);
-    if (auto* state = active_capture.load(std::memory_order_acquire); state != nullptr) {
-        state->process(double_buffer_index);
+    if (auto reader = active_capture.try_acquire(); reader.has_value()) {
+        reader->get().process(double_buffer_index);
     }
 }
 
 void sample_rate_did_change(const ASIOSampleRate sample_rate) noexcept {
     static_cast<void>(sample_rate);
-    if (auto* state = active_capture.load(std::memory_order_acquire); state != nullptr) {
-        state->sample_rate_changed.store(true, std::memory_order_release);
+    if (auto reader = active_capture.try_acquire(); reader.has_value()) {
+        reader->get().sample_rate_changed.store(true, std::memory_order_release);
     }
 }
 
@@ -405,20 +446,21 @@ long asio_message(
     if (selector == kAsioEngineVersion) return 2L;
     if (selector == kAsioSupportsTimeInfo) return 1L;
 
-    auto* state = active_capture.load(std::memory_order_acquire);
-    if (state == nullptr) return 0L;
+    auto reader = active_capture.try_acquire();
+    if (!reader.has_value()) return 0L;
+    auto& state = reader->get();
     switch (selector) {
     case kAsioResetRequest:
-        state->reset_requested.store(true, std::memory_order_release);
+        state.reset_requested.store(true, std::memory_order_release);
         return 1L;
     case kAsioResyncRequest:
-        state->resync_requested.store(true, std::memory_order_release);
+        state.resync_requested.store(true, std::memory_order_release);
         return 1L;
     case kAsioLatenciesChanged:
-        state->latencies_changed.store(true, std::memory_order_release);
+        state.latencies_changed.store(true, std::memory_order_release);
         return 1L;
     case kAsioOverload:
-        state->overload.store(true, std::memory_order_release);
+        state.overload.store(true, std::memory_order_release);
         return 1L;
     default:
         return 0L;
@@ -436,12 +478,7 @@ ASIOTime* buffer_switch_time_info(
 class ActiveCaptureGuard final {
 public:
     explicit ActiveCaptureGuard(CaptureState& state) : state_(&state) {
-        CaptureState* expected = nullptr;
-        if (!active_capture.compare_exchange_strong(
-                expected,
-                state_,
-                std::memory_order_acq_rel,
-                std::memory_order_acquire)) {
+        if (!active_capture.try_activate(state)) {
             throw CaptureError(
                 ErrorCode::backend_failure,
                 "Only one ASIO capture can run in this process at a time.");
@@ -449,59 +486,87 @@ public:
     }
 
     ~ActiveCaptureGuard() {
-        if (state_ != nullptr) {
-            active_capture.store(nullptr, std::memory_order_release);
-        }
+        deactivate_and_wait();
     }
 
     ActiveCaptureGuard(const ActiveCaptureGuard&) = delete;
     ActiveCaptureGuard& operator=(const ActiveCaptureGuard&) = delete;
 
+    void deactivate_and_wait() noexcept {
+        if (state_ == nullptr) return;
+        active_capture.deactivate_and_wait();
+        state_ = nullptr;
+    }
+
 private:
     CaptureState* state_ = nullptr;
 };
 
-class BufferGuard final {
-public:
-    explicit BufferGuard(IASIO& driver) noexcept : driver_(&driver) {}
-    ~BufferGuard() { static_cast<void>(dispose()); }
-
-    BufferGuard(const BufferGuard&) = delete;
-    BufferGuard& operator=(const BufferGuard&) = delete;
-
-    [[nodiscard]] long dispose() noexcept {
-        if (driver_ == nullptr) return ASE_OK;
-        auto* driver = std::exchange(driver_, nullptr);
-        return driver->disposeBuffers();
-    }
-
-private:
-    IASIO* driver_ = nullptr;
+struct CaptureCleanupResults {
+    long stop_result = ASE_OK;
+    long dispose_result = ASE_OK;
 };
 
-class StreamGuard final {
+class CaptureResourceGuard final {
 public:
-    explicit StreamGuard(IASIO& driver) noexcept : driver_(&driver) {}
-    ~StreamGuard() { static_cast<void>(stop()); }
+    CaptureResourceGuard(
+        IASIO& driver,
+        CaptureState& state,
+        AsioStreamWorkers& stream_workers)
+        : driver_(&driver),
+          stream_workers_(&stream_workers),
+          active_capture_(state) {}
+    ~CaptureResourceGuard() { static_cast<void>(cleanup()); }
 
-    StreamGuard(const StreamGuard&) = delete;
-    StreamGuard& operator=(const StreamGuard&) = delete;
+    CaptureResourceGuard(const CaptureResourceGuard&) = delete;
+    CaptureResourceGuard& operator=(const CaptureResourceGuard&) = delete;
 
-    void mark_started() noexcept { started_ = true; }
+    // Arm before invoking the corresponding driver operation. Some drivers
+    // partially allocate/start before returning an error.
+    void arm_buffers() noexcept { buffers_may_exist_ = true; }
+    void arm_stream() noexcept { stream_may_be_running_ = true; }
 
-    [[nodiscard]] long stop() noexcept {
-        if (!started_) return ASE_OK;
-        started_ = false;
-        return driver_->stop();
+    [[nodiscard]] CaptureCleanupResults cleanup(
+        const bool drain_completed_recording = false) noexcept {
+        if (cleaned_) return results_;
+        cleaned_ = true;
+
+        // ASIOStop guarantees that no new callbacks are issued after it
+        // returns. Closing the gate next rejects a non-compliant late callback
+        // and waits for every callback that entered before close. Buffers are
+        // disposed only after that lifetime barrier.
+        if (stream_may_be_running_) {
+            stream_may_be_running_ = false;
+            results_.stop_result = driver_->stop();
+        }
+        active_capture_.deactivate_and_wait();
+
+        // With callbacks stopped and drained, no producer/consumer can touch
+        // either ring again. A complete capture lets the writer drain its last
+        // exact block and flush/close; every abnormal path wakes both workers
+        // before joining so a full/empty ring cannot deadlock cleanup.
+        if (!drain_completed_recording) stream_workers_->request_stop();
+        stream_workers_->join();
+        if (buffers_may_exist_) {
+            buffers_may_exist_ = false;
+            results_.dispose_result = driver_->disposeBuffers();
+        }
+        return results_;
     }
 
 private:
     IASIO* driver_ = nullptr;
-    bool started_ = false;
+    AsioStreamWorkers* stream_workers_ = nullptr;
+    ActiveCaptureGuard active_capture_;
+    bool buffers_may_exist_ = false;
+    bool stream_may_be_running_ = false;
+    bool cleaned_ = false;
+    CaptureCleanupResults results_;
 };
 
 [[nodiscard]] bool fatal_driver_event(const CaptureState& state) noexcept {
-    return state.reset_requested.load(std::memory_order_acquire)
+    return state.streams->failed()
+        || state.reset_requested.load(std::memory_order_acquire)
         || state.resync_requested.load(std::memory_order_acquire)
         || state.sample_rate_changed.load(std::memory_order_acquire)
         || state.overload.load(std::memory_order_acquire)
@@ -511,6 +576,26 @@ private:
 }
 
 [[noreturn]] void throw_capture_state_error(const CaptureState& state) {
+    switch (state.streams->failure()) {
+    case AsioStreamFailure::playback_underflow:
+        throw CaptureError(
+            ErrorCode::playback_stream_underflow,
+            "The source audio could not be streamed to the ASIO driver fast enough.");
+    case AsioStreamFailure::recording_overflow:
+        throw CaptureError(
+            ErrorCode::recording_stream_overflow,
+            "The ASIO recording could not be drained to disk fast enough.");
+    case AsioStreamFailure::source_failure:
+        throw CaptureError(
+            ErrorCode::source_stream_failure,
+            "The source audio could not be read during ASIO capture.");
+    case AsioStreamFailure::writer_failure:
+        throw CaptureError(
+            ErrorCode::recording_write_failure,
+            "The temporary ASIO recording could not be written or closed.");
+    case AsioStreamFailure::none:
+        break;
+    }
     if (state.reset_requested.load(std::memory_order_acquire)) {
         throw CaptureError(ErrorCode::backend_failure, "The ASIO driver requested a reset.");
     }
@@ -545,7 +630,8 @@ private:
 } // namespace
 
 RawAudioCaptureResult AsioAudioBackend::capture(const RawAudioCaptureRequest& request) {
-    validate_playback_buffer(request.playback);
+    const auto session_lease = acquire_asio_session();
+    validate_playback_plan(request.playback_plan);
     if (request.cancellation && request.cancellation->is_cancelled()) {
         throw CaptureError(ErrorCode::capture_cancelled, "ASIO capture was cancelled.");
     }
@@ -553,7 +639,7 @@ RawAudioCaptureResult AsioAudioBackend::capture(const RawAudioCaptureRequest& re
     const auto registration = find_asio_driver(request.route.driver_id);
     AsioDriverSession session(registration);
     auto& driver = session.driver();
-    configure_sample_rate(driver, request.playback.sample_rate);
+    configure_sample_rate(driver, request.playback_plan.sample_rate());
 
     long native_inputs = 0;
     long native_outputs = 0;
@@ -586,19 +672,36 @@ RawAudioCaptureResult AsioAudioBackend::capture(const RawAudioCaptureRequest& re
     const auto buffer_size = preferred_buffer_size(driver);
 
     const auto pre_pad_frames = padding_frames(request);
-    const auto playback_frames = request.playback.frame_count();
+    const auto playback_frames = request.playback_plan.playback_frame_count;
     if (pre_pad_frames > (std::numeric_limits<std::int64_t>::max() - playback_frames) / 2) {
         throw CaptureError(ErrorCode::validation_failed, "ASIO capture duration is too large.");
     }
     const auto total_frames = pre_pad_frames + playback_frames + pre_pad_frames;
     const auto record_channels = request.route.record_channels.size();
-    AudioBuffer recorded{
-        .sample_rate = request.playback.sample_rate,
-        .channel_count = static_cast<std::uint32_t>(record_channels),
-        .samples = std::vector<float>(
-            checked_sample_count(total_frames, record_channels, "recorded"),
-            0.0F),
-    };
+    AsioStreamWorkers streams(
+        request.playback_plan,
+        static_cast<std::uint32_t>(record_channels),
+        total_frames,
+        static_cast<std::size_t>(buffer_size),
+        request.scratch_file_prefix);
+    streams.start();
+    const auto buffer_frames = static_cast<std::size_t>(buffer_size);
+    if (buffer_frames > std::numeric_limits<std::size_t>::max() / 4) {
+        throw CaptureError(
+            ErrorCode::validation_failed,
+            "The ASIO playback prebuffer is too large.");
+    }
+    const auto quarter_second = std::ceil(request.playback_plan.sample_rate() * 0.25);
+    if (!std::isfinite(quarter_second)
+        || quarter_second > static_cast<double>(std::numeric_limits<std::size_t>::max())) {
+        throw CaptureError(
+            ErrorCode::validation_failed,
+            "The ASIO playback prebuffer duration is too large.");
+    }
+    streams.wait_until_playback_ready(
+        std::max(buffer_frames * 4, static_cast<std::size_t>(quarter_second)),
+        std::chrono::seconds(10),
+        request.cancellation);
 
     std::vector<ASIOBufferInfo> buffers;
     buffers.reserve(output_info.size() + input_info.size());
@@ -624,8 +727,8 @@ RawAudioCaptureResult AsioAudioBackend::capture(const RawAudioCaptureRequest& re
 
     CaptureState state(
         driver,
-        request.playback,
-        recorded,
+        request.playback_plan,
+        streams,
         buffers,
         output_info,
         input_info,
@@ -641,10 +744,10 @@ RawAudioCaptureResult AsioAudioBackend::capture(const RawAudioCaptureRequest& re
 
     bool cancelled = false;
     bool timed_out = false;
-    long stop_result = ASE_OK;
-    long dispose_result = ASE_OK;
+    CaptureCleanupResults cleanup_results;
     {
-        ActiveCaptureGuard active_guard(state);
+        CaptureResourceGuard resources(driver, state, streams);
+        resources.arm_buffers();
         require_asio_result(
             driver,
             driver.createBuffers(
@@ -653,7 +756,6 @@ RawAudioCaptureResult AsioAudioBackend::capture(const RawAudioCaptureRequest& re
                 buffer_size,
                 &callbacks),
             "create ASIO buffers");
-        BufferGuard buffer_guard(driver);
 
         for (std::size_t channel = 0; channel < output_info.size(); ++channel) {
             const auto byte_count = static_cast<std::size_t>(buffer_size)
@@ -672,6 +774,7 @@ RawAudioCaptureResult AsioAudioBackend::capture(const RawAudioCaptureRequest& re
                 ErrorCode::backend_failure,
                 "Could not prefill the first ASIO output buffer.");
         }
+        if (streams.failed()) throw_capture_state_error(state);
         state.output_ready_supported = asio_result_succeeded(driver.outputReady());
 
         if (request.progress) request.progress(0, total_frames);
@@ -679,13 +782,16 @@ RawAudioCaptureResult AsioAudioBackend::capture(const RawAudioCaptureRequest& re
             throw CaptureError(ErrorCode::capture_cancelled, "ASIO capture was cancelled.");
         }
 
-        StreamGuard stream_guard(driver);
+        resources.arm_stream();
         require_asio_result(driver, driver.start(), "start ASIO capture");
-        stream_guard.mark_started();
 
         const auto expected_seconds = static_cast<double>(total_frames)
-            / request.playback.sample_rate;
-        const auto timeout_seconds = std::max(10.0, expected_seconds + 5.0);
+            / request.playback_plan.sample_rate();
+        const auto driver_pipeline_seconds = 2.0 * static_cast<double>(buffer_size)
+            / request.playback_plan.sample_rate();
+        const auto timeout_seconds = std::max(
+            10.0,
+            expected_seconds + std::max(5.0, driver_pipeline_seconds));
         const auto deadline = std::chrono::steady_clock::now()
             + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                 std::chrono::duration<double>(timeout_seconds));
@@ -726,17 +832,18 @@ RawAudioCaptureResult AsioAudioBackend::capture(const RawAudioCaptureRequest& re
             if (wait_result == WAIT_FAILED) Sleep(1);
         }
 
-        // A normal completion publishes done only after outputReady and the
-        // callback body finish. Fatal driver notifications may arrive earlier,
-        // so also wait for any in-flight buffer callback before calling stop.
-        while (state.processing.test(std::memory_order_acquire)) {
-            SwitchToThread();
-        }
-
-        stop_result = stream_guard.stop();
-        dispose_result = buffer_guard.dispose();
+        const auto drain_completed_recording = !cancelled
+            && !timed_out
+            && !fatal_driver_event(state)
+            && state.done.load(std::memory_order_acquire)
+            && streams.recording_producer_finished();
+        cleanup_results = resources.cleanup(drain_completed_recording);
     }
 
+    // Cancellation wins a close race with a driver/worker failure, matching
+    // the public capture contract.
+    cancelled = cancelled
+        || (request.cancellation && request.cancellation->is_cancelled());
     if (cancelled) {
         throw CaptureError(ErrorCode::capture_cancelled, "ASIO capture was cancelled.");
     }
@@ -744,8 +851,8 @@ RawAudioCaptureResult AsioAudioBackend::capture(const RawAudioCaptureRequest& re
         throw CaptureError(ErrorCode::capture_timed_out, "ASIO capture timed out.");
     }
     if (fatal_driver_event(state)) throw_capture_state_error(state);
-    require_asio_result(driver, stop_result, "stop ASIO capture");
-    require_asio_result(driver, dispose_result, "dispose ASIO buffers");
+    require_asio_result(driver, cleanup_results.stop_result, "stop ASIO capture");
+    require_asio_result(driver, cleanup_results.dispose_result, "dispose ASIO buffers");
 
     const auto completed = state.completed_frames.load(std::memory_order_acquire);
     if (completed < total_frames) {
@@ -753,9 +860,14 @@ RawAudioCaptureResult AsioAudioBackend::capture(const RawAudioCaptureRequest& re
             ErrorCode::backend_failure,
             "ASIO capture stopped before all requested frames were recorded.");
     }
+    if (!streams.writer_finished()) {
+        throw CaptureError(
+            ErrorCode::recording_write_failure,
+            "The temporary ASIO recording did not finish flushing to disk.");
+    }
     if (request.progress) request.progress(total_frames, total_frames);
     return {
-        .recorded = std::move(recorded),
+        .recorded = streams.take_recorded_asset(),
         .pre_pad_frames = pre_pad_frames,
     };
 }

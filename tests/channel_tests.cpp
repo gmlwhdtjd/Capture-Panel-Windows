@@ -46,6 +46,7 @@ CP_TEST_CASE("channel parser rejects malformed specifications") {
     CP_REQUIRE(parsing_fails("1,,2"));
     CP_REQUIRE(parsing_fails("1,"));
     CP_REQUIRE(parsing_fails("4294967296"));
+    CP_REQUIRE(parsing_fails("1-65536,1"));
 }
 
 CP_TEST_CASE("channel validation accepts channels exposed by a device") {
@@ -56,8 +57,9 @@ CP_TEST_CASE("channel validation accepts channels exposed by a device") {
     CP_REQUIRE(true);
 }
 
-CP_TEST_CASE("channel validation rejects zero, empty, and out-of-range channels") {
-    for (const auto& channels : std::vector<std::vector<std::uint32_t>>{{}, {0}, {1, 3}}) {
+CP_TEST_CASE("channel validation rejects zero, empty, out-of-range, and duplicate channels") {
+    for (const auto& channels :
+         std::vector<std::vector<std::uint32_t>>{{}, {0}, {1, 3}, {1, 1}}) {
         bool failed = false;
         try {
             validate_playback_channels(channels, 2);
@@ -66,4 +68,12 @@ CP_TEST_CASE("channel validation rejects zero, empty, and out-of-range channels"
         }
         CP_REQUIRE(failed);
     }
+
+    bool duplicate_record_failed = false;
+    try {
+        validate_record_channels(std::vector<std::uint32_t>{2, 2}, 2);
+    } catch (const CaptureError& error) {
+        duplicate_record_failed = error.code() == ErrorCode::validation_failed;
+    }
+    CP_REQUIRE(duplicate_record_failed);
 }

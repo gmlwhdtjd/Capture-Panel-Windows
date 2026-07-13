@@ -1,10 +1,12 @@
 #include "test_framework.hpp"
 
 #include "capture_panel/core/verification.hpp"
+#include "capture_panel/core/errors.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 using namespace capture_panel;
@@ -30,6 +32,33 @@ namespace {
 }
 
 } // namespace
+
+CP_TEST_CASE("verification signal rejects unsafe rates and channel dimensions") {
+    for (const auto sample_rate : std::vector<double>{
+             0.0,
+             999.0,
+             768'001.0,
+             std::numeric_limits<double>::infinity(),
+             std::numeric_limits<double>::quiet_NaN(),
+             std::numeric_limits<double>::max()}) {
+        bool failed = false;
+        try {
+            static_cast<void>(make_verification_signal(sample_rate, 1));
+        } catch (const CaptureError& error) {
+            failed = error.code() == ErrorCode::unsupported_sample_rate;
+        }
+        CP_REQUIRE(failed);
+    }
+
+    bool bad_channels = false;
+    try {
+        static_cast<void>(make_verification_signal(
+            48'000.0, std::numeric_limits<std::uint32_t>::max()));
+    } catch (const CaptureError& error) {
+        bad_channels = error.code() == ErrorCode::validation_failed;
+    }
+    CP_REQUIRE(bad_channels);
+}
 
 CP_TEST_CASE("verification signal is a framed logarithmic sweep") {
     const auto signal = make_verification_signal(10'000.0, 1, -12.0);
@@ -85,6 +114,49 @@ CP_TEST_CASE("verification uses recorded channel count when playback and recordi
     CP_REQUIRE(result.failures.empty());
     CP_REQUIRE(result.start_offset_frames == 0);
     CP_REQUIRE(result.sweep.has_value());
+    CP_REQUIRE(result.sweep->direct_score > 0.99);
+}
+
+CP_TEST_CASE("verification correlation keeps identical and opposite-polarity record channels") {
+    const auto signal = make_verification_signal(10'000.0, 2);
+    for (const auto second_channel_polarity : {1.0F, -1.0F}) {
+        auto aligned = signal.audio;
+        for (std::int64_t frame = 0; frame < aligned.frame_count(); ++frame) {
+            const auto first_index = static_cast<std::size_t>(frame) * 2U;
+            aligned.samples[first_index + 1U] =
+                aligned.samples[first_index] * second_channel_polarity;
+        }
+
+        const auto result = evaluate_verification(
+            aligned, signal, empty_alignment_info(), -12.0);
+
+        CP_REQUIRE(result.failures.empty());
+        CP_REQUIRE(result.start_offset_frames == 0);
+        CP_REQUIRE(result.sweep.has_value());
+        CP_REQUIRE(result.sweep->reliability == VerificationReliability::reliable);
+        CP_REQUIRE(result.sweep->direct_score > 0.99);
+    }
+}
+
+CP_TEST_CASE("verification correlation ignores a louder uncorrelated record channel") {
+    const auto signal = make_verification_signal(10'000.0, 2);
+    auto aligned = signal.audio;
+    std::uint32_t noise_state = 0xC0FFEEU;
+    for (std::int64_t frame = 0; frame < aligned.frame_count(); ++frame) {
+        noise_state = noise_state * 1'664'525U + 1'013'904'223U;
+        const auto normalized = static_cast<float>((noise_state >> 8U) & 0x00FF'FFFFU)
+                / static_cast<float>(0x00FF'FFFFU)
+            * 2.0F - 1.0F;
+        aligned.samples[static_cast<std::size_t>(frame) * 2U + 1U] = normalized * 0.7F;
+    }
+
+    const auto result = evaluate_verification(
+        aligned, signal, empty_alignment_info(), -3.0);
+
+    CP_REQUIRE(result.failures.empty());
+    CP_REQUIRE(result.start_offset_frames == 0);
+    CP_REQUIRE(result.sweep.has_value());
+    CP_REQUIRE(result.sweep->reliability == VerificationReliability::reliable);
     CP_REQUIRE(result.sweep->direct_score > 0.99);
 }
 
@@ -180,6 +252,56 @@ CP_TEST_CASE("verification keeps direct timing but reports a stronger delayed ec
     CP_REQUIRE(result.sweep->reliability == VerificationReliability::ambiguous);
     CP_REQUIRE(result.sweep->ambiguity_ratio.has_value());
     CP_REQUIRE(*result.sweep->ambiguity_ratio > 1.0);
+    CP_REQUIRE(contains_warning(result, CaptureWarning::verification_ambiguous));
+}
+
+CP_TEST_CASE("verification keeps strong ambiguous evidence over a weak reliable coincidence") {
+    const auto signal = make_verification_signal(10'000.0, 1);
+    auto strong_ambiguous = signal.audio.samples;
+    const auto half_sweep = signal.sweep_frame_range.size() / 2;
+    for (auto frame = signal.sweep_frame_range.lower_bound + half_sweep;
+         frame < signal.sweep_frame_range.upper_bound;
+         ++frame) {
+        strong_ambiguous[static_cast<std::size_t>(frame)] = 0.0F;
+    }
+    const auto echo_start = signal.sweep_frame_range.upper_bound + 1'000;
+    for (std::int64_t offset = 0; offset < signal.sweep_frame_range.size(); ++offset) {
+        const auto source_frame = signal.sweep_frame_range.lower_bound + offset;
+        const auto target_frame = echo_start + offset;
+        if (target_frame >= signal.audio.frame_count()) continue;
+        strong_ambiguous[static_cast<std::size_t>(target_frame)] =
+            signal.audio.samples[static_cast<std::size_t>(source_frame)];
+    }
+
+    std::vector<float> weak_coincidence(signal.audio.samples.size(), 0.0F);
+    std::uint32_t noise_state = 0x51A7E123U;
+    for (std::size_t index = 0; index < weak_coincidence.size(); ++index) {
+        noise_state = noise_state * 1'664'525U + 1'013'904'223U;
+        const auto normalized = static_cast<float>((noise_state >> 8U) & 0x00FF'FFFFU)
+                / static_cast<float>(0x00FF'FFFFU)
+            * 2.0F - 1.0F;
+        weak_coincidence[index] = normalized * 0.5F
+            + signal.audio.samples[index] * 0.2F;
+    }
+
+    AudioBuffer aligned{
+        .sample_rate = signal.audio.sample_rate,
+        .channel_count = 2,
+        .samples = std::vector<float>(signal.audio.samples.size() * 2U, 0.0F),
+    };
+    for (std::size_t frame = 0; frame < strong_ambiguous.size(); ++frame) {
+        aligned.samples[frame * 2U] = strong_ambiguous[frame];
+        aligned.samples[frame * 2U + 1U] = weak_coincidence[frame];
+    }
+
+    const auto result = evaluate_verification(
+        aligned, signal, empty_alignment_info(), -3.0);
+
+    CP_REQUIRE(result.failures.empty());
+    CP_REQUIRE(result.start_offset_frames == 0);
+    CP_REQUIRE(result.sweep.has_value());
+    CP_REQUIRE(result.sweep->direct_score > 0.5);
+    CP_REQUIRE(result.sweep->reliability == VerificationReliability::ambiguous);
     CP_REQUIRE(contains_warning(result, CaptureWarning::verification_ambiguous));
 }
 

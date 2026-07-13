@@ -6,14 +6,15 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   DOTNET_CLI_TELEMETRY_OPTOUT: "1"
   DOTNET_NOLOGO: "1"
 
 jobs:
-  release:
+  build-and-package:
+    name: Build, test, and package
     runs-on: windows-2025-vs2026
 
     steps:
@@ -21,6 +22,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up .NET SDK
         uses: actions/setup-dotnet@v5
@@ -182,13 +184,77 @@ jobs:
             dist/SHA256SUMS
           if-no-files-found: error
 
+  publish:
+    name: Publish GitHub release
+    needs: build-and-package
+    runs-on: windows-2025-vs2026
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified package
+        uses: actions/download-artifact@v7
+        with:
+          name: capture-panel-windows-${{ github.ref_name }}
+          path: dist
+
+      - name: Verify tag still targets the triggering commit
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Release tags must use vX.Y.Z; received '$tag'"
+          }
+
+          $tagCommit = (& gh api `
+            "repos/$env:GITHUB_REPOSITORY/commits/$tag" `
+            --jq '.sha').Trim()
+          if ($LASTEXITCODE -ne 0 -or -not $tagCommit) {
+            throw "Could not resolve release tag '$tag'"
+          }
+          if (-not $tagCommit.Equals($env:GITHUB_SHA, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Release tag moved: event commit '$env:GITHUB_SHA', current target '$tagCommit'"
+          }
+
       - name: Create GitHub release
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $assets = (Get-ChildItem -LiteralPath '.\dist' -File).FullName
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $assetNames = @(
+            "capture-panel-windows-$tag.zip",
+            "capture-panel-windows-$tag-source.zip",
+            'SHA256SUMS'
+          )
+          $assets = foreach ($name in $assetNames) {
+            $path = Join-Path '.\dist' $name
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Downloaded release artifact is missing '$name'"
+            }
+            (Resolve-Path -LiteralPath $path).Path
+          }
+
+          $checksumLines = Get-Content -LiteralPath '.\dist\SHA256SUMS'
+          foreach ($name in $assetNames | Where-Object { $_ -ne 'SHA256SUMS' }) {
+            $line = $checksumLines | Where-Object { $_ -match "^[0-9a-fA-F]{64}  $([regex]::Escape($name))$" }
+            if (@($line).Count -ne 1) {
+              throw "SHA256SUMS has no unique entry for '$name'"
+            }
+            $expectedHash = ($line -split '  ', 2)[0]
+            $actualHash = (Get-FileHash -LiteralPath (Join-Path '.\dist' $name) `
+              -Algorithm SHA256).Hash
+            if (-not $actualHash.Equals($expectedHash, [StringComparison]::OrdinalIgnoreCase)) {
+              throw "Checksum mismatch for '$name'"
+            }
+          }
+
           gh release create $env:GITHUB_REF_NAME $assets `
+            --repo $env:GITHUB_REPOSITORY `
             --verify-tag `
             --generate-notes `
             --title "Capture Panel for Windows $env:GITHUB_REF_NAME"

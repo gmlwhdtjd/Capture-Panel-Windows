@@ -20,17 +20,26 @@
 
 namespace {
 
-std::atomic<capture_panel::CancellationToken*> active_cancellation{nullptr};
-static_assert(std::atomic<capture_panel::CancellationToken*>::is_always_lock_free);
+[[nodiscard]] capture_panel::CancellationToken& console_cancellation() {
+    // Console control handlers run on an operating-system thread and may still
+    // be returning while wmain unwinds. Deliberately retain this token until
+    // process teardown so a handler that passed the active check can never
+    // dereference a destroyed object. wmain initializes it before registering
+    // the handler.
+    static auto* const token = new capture_panel::CancellationToken();
+    return *token;
+}
+
+std::atomic_bool console_cancellation_active{false};
+static_assert(std::atomic_bool::is_always_lock_free);
 
 BOOL WINAPI console_control_handler(const DWORD event) noexcept {
     if (event != CTRL_C_EVENT && event != CTRL_BREAK_EVENT
         && event != CTRL_CLOSE_EVENT) {
         return FALSE;
     }
-    if (auto* cancellation = active_cancellation.load(std::memory_order_acquire);
-        cancellation != nullptr) {
-        cancellation->cancel();
+    if (console_cancellation_active.load(std::memory_order_acquire)) {
+        console_cancellation().cancel();
         return TRUE;
     }
     return FALSE;
@@ -38,16 +47,16 @@ BOOL WINAPI console_control_handler(const DWORD event) noexcept {
 
 class ConsoleCancellationRegistration final {
 public:
-    explicit ConsoleCancellationRegistration(capture_panel::CancellationToken& cancellation) {
-        active_cancellation.store(&cancellation, std::memory_order_release);
+    ConsoleCancellationRegistration() {
+        console_cancellation_active.store(true, std::memory_order_release);
         if (SetConsoleCtrlHandler(console_control_handler, TRUE) == FALSE) {
-            active_cancellation.store(nullptr, std::memory_order_release);
+            console_cancellation_active.store(false, std::memory_order_release);
             throw std::runtime_error("Could not install the console cancellation handler.");
         }
     }
 
     ~ConsoleCancellationRegistration() {
-        active_cancellation.store(nullptr, std::memory_order_release);
+        console_cancellation_active.store(false, std::memory_order_release);
         static_cast<void>(SetConsoleCtrlHandler(console_control_handler, FALSE));
     }
 
@@ -88,7 +97,9 @@ int wmain(int argc, wchar_t* argv[]) {
     }
     try {
         SetConsoleOutputCP(CP_UTF8);
-        auto cancellation = std::make_shared<capture_panel::CancellationToken>();
+        auto cancellation = std::shared_ptr<capture_panel::CancellationToken>(
+            &console_cancellation(),
+            [](capture_panel::CancellationToken*) noexcept {});
         auto asio_backend = std::make_shared<capture_panel::asio::AsioAudioBackend>();
         auto fake_backend = std::make_shared<capture_panel::fake::FakeAudioBackend>();
         auto backends = std::make_shared<capture_panel::backends::BackendRouter>();
@@ -102,7 +113,7 @@ int wmain(int argc, wchar_t* argv[]) {
         std::optional<ConsoleCancellationRegistration> cancellation_registration;
         if (!arguments.empty()
             && (arguments.front() == "test" || arguments.front() == "run")) {
-            cancellation_registration.emplace(*cancellation);
+            cancellation_registration.emplace();
         }
         return capture_panel::cli::run_cli(
             arguments,

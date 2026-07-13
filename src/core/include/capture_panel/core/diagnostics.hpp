@@ -21,6 +21,10 @@ namespace capture_panel {
     case ErrorCode::alignment_failed: return "alignment_failed";
     case ErrorCode::capture_cancelled: return "capture_cancelled";
     case ErrorCode::capture_timed_out: return "capture_timed_out";
+    case ErrorCode::playback_stream_underflow: return "playback_stream_underflow";
+    case ErrorCode::recording_stream_overflow: return "recording_stream_overflow";
+    case ErrorCode::source_stream_failure: return "source_stream_failure";
+    case ErrorCode::recording_write_failure: return "recording_write_failure";
     case ErrorCode::backend_failure: return "backend_failure";
     }
     return "unknown";

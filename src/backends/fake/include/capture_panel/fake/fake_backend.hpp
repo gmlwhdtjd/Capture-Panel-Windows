@@ -40,10 +40,6 @@ public:
 
 private:
     void validate_device_id(const std::string& id) const;
-    void validate_channels(
-        const std::vector<std::uint32_t>& channels,
-        std::uint32_t available,
-        std::string_view direction) const;
 
     FakeBackendOptions options_;
 };

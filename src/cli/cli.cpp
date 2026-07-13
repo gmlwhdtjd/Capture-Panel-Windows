@@ -2,6 +2,7 @@
 
 #include "capture_panel/core/capture.hpp"
 #include "capture_panel/core/channels.hpp"
+#include "capture_panel/core/constants.hpp"
 #include "capture_panel/core/diagnostics.hpp"
 #include "capture_panel/core/errors.hpp"
 
@@ -147,6 +148,12 @@ void append_json_number(std::string& destination, const double value) {
         return;
     }
     destination.append(buffer.data(), end);
+}
+
+[[nodiscard]] std::string invariant_number_text(const double value) {
+    std::string result;
+    append_json_number(result, value);
+    return result;
 }
 
 class JsonObject final {
@@ -492,6 +499,20 @@ void write_json_line(std::ostream& output, const std::string_view json) {
     }
 }
 
+[[nodiscard]] double parse_trim_db(
+    const std::string& value,
+    const std::string_view label,
+    const double minimum,
+    const double maximum) {
+    const auto parsed = parse_finite_double(value, label);
+    if (parsed < minimum || parsed > maximum) {
+        throw std::invalid_argument(
+            std::string(label) + " must be between " + invariant_number_text(minimum)
+            + " and " + invariant_number_text(maximum) + " dB.");
+    }
+    return parsed;
+}
+
 [[nodiscard]] AudioBitDepth parse_bit_depth(const std::string& value) {
     if (value == "16") return AudioBitDepth::pcm16;
     if (value == "24") return AudioBitDepth::pcm24;
@@ -501,6 +522,16 @@ void write_json_line(std::ostream& output, const std::string_view json) {
 
 [[nodiscard]] bool matches_option(const std::string& argument, std::string_view name) {
     return std::string_view(argument) == name || argument.starts_with(std::string(name) + '=');
+}
+
+[[nodiscard]] bool looks_like_option(const std::string_view argument) noexcept {
+    // A leading double dash always denotes an option in this CLI. Single-dash
+    // negative numbers remain valid separate values for gain options.
+    return argument.starts_with("--")
+        || argument == "-h"
+        || argument == "-v"
+        || argument == "-i"
+        || argument == "-o";
 }
 
 [[nodiscard]] std::string option_value(
@@ -521,7 +552,7 @@ void write_json_line(std::ostream& output, const std::string_view json) {
     if (!matches_long && !matches_short) {
         throw std::logic_error("option_value called for a different option");
     }
-    if (++index >= args.size()) {
+    if (++index >= args.size() || looks_like_option(args[index])) {
         throw std::invalid_argument(std::string(long_name) + " requires a value.");
     }
     return args[index];
@@ -575,14 +606,27 @@ void print_command_help(const std::string& topic, std::ostream& output) {
     } else if (topic == "test") {
         output
             << "Usage: capture-panel test --driver <id> --play-channel <spec> "
-               "--record-channel <spec> [--sample-rate <Hz>] [--output-trim <dB>] "
-               "[--input-trim <dB>] [--json] [--verbose]\n";
+               "--record-channel <spec> [--sample-rate <"
+            << invariant_number_text(constants::audio::minimum_supported_sample_rate) << ".."
+            << invariant_number_text(constants::audio::maximum_supported_sample_rate)
+            << ">] [--output-trim <"
+            << invariant_number_text(constants::gain::output_minimum_db) << ".."
+            << invariant_number_text(constants::gain::output_maximum_db)
+            << ">] [--input-trim <"
+            << invariant_number_text(constants::gain::input_minimum_db) << ".."
+            << invariant_number_text(constants::gain::input_maximum_db)
+            << ">] [--json] [--verbose]\n";
     } else if (topic == "run") {
         output
             << "Usage: capture-panel run --input <source.wav> --output <result.wav> "
                "--driver <id> --play-channel <spec> --record-channel <spec> "
-               "[--bit-depth <16|24|32>] [--output-trim <dB>] [--input-trim <dB>] "
-               "[--json] [--verbose]\n";
+               "[--bit-depth <16|24|32>] [--output-trim <"
+            << invariant_number_text(constants::gain::output_minimum_db) << ".."
+            << invariant_number_text(constants::gain::output_maximum_db)
+            << ">] [--input-trim <"
+            << invariant_number_text(constants::gain::input_minimum_db) << ".."
+            << invariant_number_text(constants::gain::input_maximum_db)
+            << ">] [--json] [--verbose]\n";
     } else if (topic == "help" || topic == "version" || topic == "license") {
         output << "Usage: capture-panel " << topic << "\n";
     } else {
@@ -999,21 +1043,31 @@ ParsedCommand parse_arguments(const std::vector<std::string>& args) {
             parsed.bit_depth = parse_bit_depth(option_value(args, index, "--bit-depth"));
         } else if (matches_option(argument, "--output-trim")) {
             output_trim_seen = true;
-            parsed.output_trim_db = parse_finite_double(
+            parsed.output_trim_db = parse_trim_db(
                 option_value(args, index, "--output-trim"),
-                "--output-trim");
+                "--output-trim",
+                constants::gain::output_minimum_db,
+                constants::gain::output_maximum_db);
         } else if (matches_option(argument, "--input-trim")) {
             input_trim_seen = true;
-            parsed.input_trim_db = parse_finite_double(
+            parsed.input_trim_db = parse_trim_db(
                 option_value(args, index, "--input-trim"),
-                "--input-trim");
+                "--input-trim",
+                constants::gain::input_minimum_db,
+                constants::gain::input_maximum_db);
         } else if (matches_option(argument, "--sample-rate")) {
             sample_rate_seen = true;
             const auto sample_rate = parse_finite_double(
                 option_value(args, index, "--sample-rate"),
                 "--sample-rate");
-            if (sample_rate <= 0.0) {
-                throw std::invalid_argument("--sample-rate must be greater than zero.");
+            if (sample_rate < constants::audio::minimum_supported_sample_rate
+                || sample_rate > constants::audio::maximum_supported_sample_rate) {
+                throw std::invalid_argument(
+                    "--sample-rate must be between "
+                    + invariant_number_text(constants::audio::minimum_supported_sample_rate)
+                    + " and "
+                    + invariant_number_text(constants::audio::maximum_supported_sample_rate)
+                    + " Hz.");
             }
             parsed.sample_rate = sample_rate;
         } else if (parsed.command == Command::channels && !argument.empty()

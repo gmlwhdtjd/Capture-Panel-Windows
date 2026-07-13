@@ -60,11 +60,11 @@ public:
         validate_id(request.route.driver_id);
         ++captures;
         return {
-            .recorded = AudioBuffer{
+            .recorded = Float32AudioAsset::from_memory(AudioBuffer{
                 .sample_rate = device_.sample_rate,
                 .channel_count = 1,
                 .samples = {capture_sample},
-            },
+            }),
             .pre_pad_frames = 0,
         };
     }
@@ -142,17 +142,28 @@ CP_TEST_CASE("BackendRouter delegates channel rate and capture operations by dri
             .playback_channels = {9},
             .record_channels = {1},
         },
-        .playback = AudioBuffer{
-            .sample_rate = 44'100.0,
-            .channel_count = 1,
-            .samples = {0.5F},
+        .playback_plan = {
+            .source = CaptureAudioSource::from_memory(AudioBuffer{
+                .sample_rate = 44'100.0,
+                .channel_count = 1,
+                .samples = {0.5F},
+            }),
+            .playback_frame_count = 1,
+            .source_start_frame = 0,
+            .playback_gain = 1.0F,
         },
     });
     CP_REQUIRE(fake->captures == 0);
     CP_REQUIRE(asio->captures == 1);
     CP_REQUIRE(asio->device_queries == device_queries_before_capture);
-    CP_REQUIRE(captured.recorded.samples.size() == 1);
-    CP_REQUIRE_NEAR(captured.recorded.samples.front(), 0.25, 0.000001);
+    const auto audio = AlignedCapturePayload{
+        .asset = captured.recorded,
+        .start_frame = 0,
+        .frame_count = 1,
+        .gain = 1.0F,
+    }.materialize();
+    CP_REQUIRE(audio.samples.size() == 1);
+    CP_REQUIRE_NEAR(audio.samples.front(), 0.25, 0.000001);
 }
 
 CP_TEST_CASE("BackendRouter reports unknown ids as device_not_found") {

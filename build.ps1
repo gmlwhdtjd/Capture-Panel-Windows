@@ -86,47 +86,52 @@ if ($Clean) {
     }
 }
 
-& $cmake --preset windows-x64
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-& $cmake --build --preset $preset
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-if ($Test) {
-    & $ctest --preset $preset
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-}
-
-$dotnetVersion = & $dotnet --version
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-Write-Host "Using .NET SDK $dotnetVersion"
-
-$nativeCli = Join-Path $buildDirectory "bin\$Configuration\capture-panel.exe"
-if (-not (Test-Path -LiteralPath $nativeCli)) {
-    throw "Native worker not found after build: $nativeCli"
-}
-$nativeVersion = ((& $nativeCli --version) -replace '^capture-panel\s+', '').Trim()
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-$managedVersion = (& $dotnet msbuild $uiProject -nologo -getProperty:Version).Trim()
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-if ($nativeVersion -ne $managedVersion) {
-    throw "Native/WPF version mismatch: native '$nativeVersion', WPF '$managedVersion'."
-}
-
-& $dotnet restore $uiProject
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-& $dotnet build $uiProject --configuration $Configuration --no-restore
-if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-if ($Test) {
-    & $dotnet restore $uiTestsProject
+Push-Location -LiteralPath $PSScriptRoot
+try {
+    & $cmake --preset windows-x64
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    & $dotnet build $uiTestsProject --configuration $Configuration --no-restore
+    & $cmake --build --preset $preset
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-    & $dotnet run --project $uiTestsProject --configuration $Configuration `
-        --no-build --no-restore
+    if ($Test) {
+        & $ctest --preset $preset
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
+
+    $dotnetVersion = & $dotnet --version
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    Write-Host "Using .NET SDK $dotnetVersion"
+
+    $nativeCli = Join-Path $buildDirectory "bin\$Configuration\capture-panel.exe"
+    if (-not (Test-Path -LiteralPath $nativeCli)) {
+        throw "Native worker not found after build: $nativeCli"
+    }
+    $nativeVersion = ((& $nativeCli --version) -replace '^capture-panel\s+', '').Trim()
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    $managedVersion = (& $dotnet msbuild $uiProject -nologo -getProperty:Version).Trim()
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    if ($nativeVersion -ne $managedVersion) {
+        throw "Native/WPF version mismatch: native '$nativeVersion', WPF '$managedVersion'."
+    }
+
+    & $dotnet restore $uiProject
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    & $dotnet build $uiProject --configuration $Configuration --no-restore
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+    if ($Test) {
+        & $dotnet restore $uiTestsProject
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+        & $dotnet build $uiTestsProject --configuration $Configuration --no-restore
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+        & $dotnet run --project $uiTestsProject --configuration $Configuration `
+            --no-build --no-restore
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    }
+} finally {
+    Pop-Location
 }

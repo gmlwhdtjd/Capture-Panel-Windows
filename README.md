@@ -11,13 +11,13 @@ worker so a faulty vendor ASIO driver cannot run inside the WPF process.
 
 ## Implemented
 
-- PCM WAV input and output (16/24/32-bit plus float32 input)
-- marker-based latency detection, alignment, and setup verification
+- bounded PCM WAV input/output streaming (16/24/32-bit plus float32 input)
+- marker-based latency detection, bounded-window alignment, and setup verification
 - one-based channel parsing and validation
 - capture progress, cancellation, timeout, and driver-event handling
 - ASIO driver discovery from the 64-bit Windows registry
 - ASIO PCM conversion for integer and floating-point LSB/MSB formats
-- allocation-free ASIO double-buffer callback processing
+- bounded SPSC playback/record transport with allocation-free ASIO callbacks
 - `devices`, `channels`, `test`, and `run` CLI commands
 - Fake full-duplex loopback for deterministic development and CI
 - WPF source, route, setup-test, capture, progress, cancellation, and settings workflow
@@ -63,6 +63,12 @@ Driver IDs are stable registry identities such as
 one-based, matching the labels shown by the CLI; the backend performs the ASIO
 zero-based translation.
 
+The CLI accepts output trim from -24 through 0 dB and input trim from -18
+through +12 dB, inclusive. Values outside these supported application ranges
+are rejected as usage errors before an audio driver is configured.
+Setup-test sample-rate overrides are bounded from 1,000 through 768,000 Hz;
+the selected ASIO driver may support a narrower set.
+
 A deterministic smoke test needs no hardware:
 
 ```powershell
@@ -86,6 +92,7 @@ require a separately installed .NET runtime or Visual C++ Redistributable.
 
 ## Documentation
 
+- [Streaming audio architecture](Docs/STREAMING_AUDIO_ARCHITECTURE.md)
 - [ASIO backend](Docs/ASIO_BACKEND.md)
 - [Hardware testing](Docs/HARDWARE_TESTING.md)
 - [Port status](Docs/PORT_STATUS.md)

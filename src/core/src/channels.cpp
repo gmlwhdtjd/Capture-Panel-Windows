@@ -9,9 +9,12 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 
 namespace capture_panel {
 namespace {
+
+constexpr std::uint64_t maximum_expanded_channels = 65'536;
 
 [[nodiscard]] std::string_view trim(const std::string_view value) noexcept {
     auto first = value.begin();
@@ -58,6 +61,9 @@ std::vector<std::uint32_t> parse_channel_spec(const std::string_view specificati
 
         const auto hyphen = part.find('-');
         if (hyphen == std::string_view::npos) {
+            if (channels.size() >= maximum_expanded_channels) {
+                throw_invalid_spec(specification);
+            }
             channels.push_back(parse_positive_channel(part));
         } else {
             if (part.find('-', hyphen + 1) != std::string_view::npos) {
@@ -69,8 +75,9 @@ std::vector<std::uint32_t> parse_channel_spec(const std::string_view specificati
 
             const auto count = static_cast<std::uint64_t>(last) - first + 1U;
             // This is well beyond any realistic ASIO channel count and bounds CLI input memory.
-            constexpr std::uint64_t maximum_expanded_channels = 65'536;
             if (count > maximum_expanded_channels
+                || static_cast<std::uint64_t>(channels.size())
+                        > maximum_expanded_channels - count
                 || count > static_cast<std::uint64_t>(channels.max_size() - channels.size())) {
                 throw_invalid_spec(part);
             }
@@ -115,6 +122,16 @@ void validate_channels(
         message << label << " channel " << maximum << " exceeds device "
                 << device_direction << " channels (" << available_channel_count << ')';
         throw CaptureError(ErrorCode::validation_failed, message.str());
+    }
+
+    std::unordered_set<std::uint32_t> unique_channels;
+    unique_channels.reserve(channels.size());
+    for (const auto channel : channels) {
+        if (!unique_channels.insert(channel).second) {
+            std::ostringstream message;
+            message << label << " channels cannot contain duplicate channel " << channel;
+            throw CaptureError(ErrorCode::validation_failed, message.str());
+        }
     }
 }
 

@@ -10,6 +10,8 @@ namespace CapturePanel.App.Services;
 public sealed class CaptureWorkerClient : ICaptureWorkerClient
 {
     private const string Protocol = "capture-panel/1";
+    private static readonly TimeSpan WorkerTerminationTimeout = TimeSpan.FromSeconds(3);
+    private readonly SemaphoreSlim _workerGate = new(1, 1);
 
     public CaptureWorkerClient(string workerPath)
     {
@@ -67,7 +69,7 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
         SetupTestResult? result = null;
         var stage = "sample_rate_configuration";
         var progressReporter = new ThrottledProgressReporter(progress);
-        await RunWorkerAsync(
+        var exitCode = await RunWorkerAsync(
             [
                 "test",
                 "--driver", request.DriverId,
@@ -92,8 +94,15 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
                 }
             },
             cancellationToken,
-            acceptNonZeroResult: () => result is not null).ConfigureAwait(false);
-        return result ?? throw ProtocolError("The worker did not return a setup-test result.");
+            acceptNonZeroResult: candidate => candidate == 1).ConfigureAwait(false);
+        var completed = result ?? throw ProtocolError("The worker did not return a setup-test result.");
+        var expectedExitCode = completed.Passed ? 0 : 1;
+        if (exitCode != expectedExitCode)
+        {
+            throw ProtocolError(
+                $"The setup-test result requires exit code {expectedExitCode}, but the worker exited with {exitCode}.");
+        }
+        return completed;
     }
 
     public async Task<CaptureCompleted> CaptureAsync(
@@ -102,6 +111,7 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
         CancellationToken cancellationToken)
     {
         CaptureCompleted? result = null;
+        var warnings = new List<DiagnosticInfo>();
         var stage = "sample_rate_configuration";
         var progressReporter = new ThrottledProgressReporter(progress);
         await RunWorkerAsync(
@@ -122,7 +132,7 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
                 var type = TypeOf(element);
                 if (type == "event")
                 {
-                    stage = ReportEvent(element, stage, progressReporter);
+                    stage = ReportEvent(element, stage, progressReporter, warnings);
                 }
                 else if (type == "capture_result")
                 {
@@ -130,14 +140,37 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
                 }
             },
             cancellationToken).ConfigureAwait(false);
-        return result ?? throw ProtocolError("The worker did not return a capture result.");
+        return result is null
+            ? throw ProtocolError("The worker did not return a capture result.")
+            : result with { Warnings = warnings.ToArray() };
     }
 
-    private async Task RunWorkerAsync(
+    private async Task<int> RunWorkerAsync(
         IReadOnlyList<string> arguments,
         Action<JsonElement> onMessage,
         CancellationToken cancellationToken,
-        Func<bool>? acceptNonZeroResult = null)
+        Func<int, bool>? acceptNonZeroResult = null)
+    {
+        await _workerGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await RunWorkerProcessAsync(
+                arguments,
+                onMessage,
+                cancellationToken,
+                acceptNonZeroResult).ConfigureAwait(false);
+        }
+        finally
+        {
+            _workerGate.Release();
+        }
+    }
+
+    private async Task<int> RunWorkerProcessAsync(
+        IReadOnlyList<string> arguments,
+        Action<JsonElement> onMessage,
+        CancellationToken cancellationToken,
+        Func<int, bool>? acceptNonZeroResult)
     {
         if (!WorkerAvailable)
         {
@@ -178,15 +211,32 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
         {
             throw new CaptureWorkerException(
                 "worker_start_failed",
-                $"Could not start the native audio worker: {exception.Message}");
+                $"Could not start the native audio worker: {exception.Message}",
+                innerException: exception);
         }
 
+        WorkerProcessJob job;
+        try
+        {
+            job = WorkerProcessJob.Attach(process);
+        }
+        catch (Exception exception)
+        {
+            TryTerminate(process);
+            _ = await WaitForExitBoundedAsync(process).ConfigureAwait(false);
+            throw new CaptureWorkerException(
+                "worker_isolation_failed",
+                $"Could not isolate the native audio worker: {exception.Message}",
+                innerException: exception);
+        }
+
+        using var workerJob = job;
         using var cancellationRegistration = cancellationToken.Register(() => TryTerminate(process));
         var standardErrorTask = process.StandardError.ReadToEndAsync(CancellationToken.None);
         CaptureWorkerException? workerError = null;
         try
         {
-            while (await process.StandardOutput.ReadLineAsync(CancellationToken.None).ConfigureAwait(false) is { } line)
+            while (await process.StandardOutput.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
             {
                 if (line.Length == 0)
                 {
@@ -223,8 +273,10 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
                 }
             }
 
-            await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
-            var standardError = (await standardErrorTask.ConfigureAwait(false)).Trim();
+            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            var standardError = (await standardErrorTask
+                .WaitAsync(WorkerTerminationTimeout)
+                .ConfigureAwait(false)).Trim();
             if (cancellationToken.IsCancellationRequested)
             {
                 throw new OperationCanceledException(cancellationToken);
@@ -233,25 +285,21 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
             {
                 throw workerError;
             }
-            if (process.ExitCode != 0 && !(acceptNonZeroResult?.Invoke() ?? false))
+            if (process.ExitCode != 0 && !(acceptNonZeroResult?.Invoke(process.ExitCode) ?? false))
             {
                 var detail = standardError.Length == 0
                     ? $"The audio worker exited with code {process.ExitCode}."
                     : standardError;
                 throw new CaptureWorkerException("worker_failed", detail, process.ExitCode);
             }
+            return process.ExitCode;
         }
         catch
         {
             TryTerminate(process);
-            try
-            {
-                await process.WaitForExitAsync(CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (InvalidOperationException)
-            {
-            }
-            _ = await standardErrorTask.ConfigureAwait(false);
+            job.Terminate();
+            _ = await WaitForExitBoundedAsync(process).ConfigureAwait(false);
+            await ObserveStandardErrorCompletionAsync(standardErrorTask).ConfigureAwait(false);
             throw;
         }
     }
@@ -259,10 +307,25 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
     private static string ReportEvent(
         JsonElement element,
         string currentStage,
-        ThrottledProgressReporter progress)
+        ThrottledProgressReporter progress,
+        List<DiagnosticInfo>? warnings = null)
     {
         var eventName = GetString(element, "event") ?? string.Empty;
         var stage = GetString(element, "stage") ?? currentStage;
+        if (eventName == "warning"
+            && warnings is not null
+            && element.TryGetProperty("warning", out var warning)
+            && warning.ValueKind == JsonValueKind.Object)
+        {
+            var code = GetString(warning, "code") ?? "unknown";
+            var message = GetString(element, "message")
+                ?? GetString(warning, "message")
+                ?? "The audio worker reported a capture warning.";
+            if (!warnings.Any(item => string.Equals(item.Code, code, StringComparison.Ordinal)))
+            {
+                warnings.Add(new DiagnosticInfo(code, message));
+            }
+        }
         if (eventName == "stage_changed")
         {
             progress.Report(
@@ -311,42 +374,85 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
 
     private static SetupTestResult ParseTestResult(JsonElement element)
     {
-        var alignment = element.GetProperty("alignment");
-        var verification = element.GetProperty("verification");
+        var alignment = GetRequiredObject(element, "alignment");
+        var verification = GetRequiredObject(element, "verification");
         var sweep = verification.TryGetProperty("sweep", out var sweepElement)
             && sweepElement.ValueKind == JsonValueKind.Object
             ? sweepElement
             : default;
+        var reliability = sweep.ValueKind == JsonValueKind.Object
+            ? GetRequiredString(sweep, "reliability")
+            : "unmeasurable";
+        if (reliability is not ("reliable" or "ambiguous" or "unmeasurable"))
+        {
+            throw ProtocolError($"The worker returned an unknown verification reliability '{reliability}'.");
+        }
+
+        var passed = GetRequiredBoolean(element, "passed");
+        var failures = ParseDiagnostics(element, "failures", required: true);
+        if (passed != (failures.Count == 0))
+        {
+            throw ProtocolError("The setup-test pass flag disagrees with its failure diagnostics.");
+        }
+
         return new SetupTestResult(
-            element.GetProperty("passed").GetBoolean(),
-            GetDouble(element, "sampleRate"),
-            GetDouble(element, "outputPeakDbfs"),
-            GetDouble(element, "inputPeakDbfs"),
-            GetNullableInt64(alignment, "markerLatencyFrames"),
-            GetNullableDouble(alignment, "markerLatencyMilliseconds"),
-            GetNullableDouble(verification, "timingFitErrorFrames"),
+            passed,
+            GetRequiredFiniteDouble(
+                element,
+                "sampleRate",
+                CaptureLimits.MinimumSampleRate,
+                CaptureLimits.MaximumSampleRate),
+            GetRequiredFiniteDouble(element, "outputPeakDbfs", minimum: -1_000, maximum: 1_000),
+            GetRequiredFiniteDouble(element, "inputPeakDbfs", minimum: -1_000, maximum: 1_000),
+            GetNullableInt64Strict(alignment, "markerLatencyFrames"),
+            GetNullableFiniteDouble(alignment, "markerLatencyMilliseconds", -3_600_000, 3_600_000),
+            GetNullableFiniteDouble(verification, "timingFitErrorFrames", 0, long.MaxValue),
             sweep.ValueKind == JsonValueKind.Object
-                ? GetString(sweep, "reliability") ?? "unmeasurable"
+                ? reliability
                 : "unmeasurable",
-            ParseDiagnostics(element, "warnings"),
-            ParseDiagnostics(element, "failures"));
+            ParseDiagnostics(element, "warnings", required: true),
+            failures);
     }
 
     private static CaptureCompleted ParseCaptureResult(JsonElement element)
     {
-        var output = element.GetProperty("output");
-        var alignment = element.GetProperty("alignment");
+        var output = GetRequiredObject(element, "output");
+        var alignment = GetRequiredObject(element, "alignment");
+        var outputPath = GetRequiredString(output, "path");
+        if (string.IsNullOrWhiteSpace(outputPath))
+        {
+            throw ProtocolError("The worker returned an empty capture output path.");
+        }
+
+        var channelCount = GetRequiredInt32(output, "channelCount", 1, 1024);
+        var bitDepth = GetRequiredInt32(output, "bitDepth", 1, 64);
+        if (bitDepth is not (16 or 24 or 32))
+        {
+            throw ProtocolError($"The worker returned an unsupported output bit depth: {bitDepth}.");
+        }
+        var trimmedFrames = GetRequiredInt64(alignment, "trimmedFrameCount", 0, long.MaxValue);
+        var targetFrames = GetRequiredInt64(alignment, "targetFrameCount", 1, long.MaxValue);
+        if (trimmedFrames > targetFrames)
+        {
+            throw ProtocolError("The worker returned more trimmed frames than target frames.");
+        }
+
         return new CaptureCompleted(
-            output.GetProperty("path").GetString() ?? string.Empty,
-            output.GetProperty("fileSize").GetInt64(),
-            output.GetProperty("channelCount").GetInt32(),
-            output.GetProperty("bitDepth").GetInt32(),
-            GetDouble(output, "sampleRate"),
-            GetDouble(element, "elapsedSeconds"),
-            GetNullableInt64(alignment, "markerLatencyFrames"),
-            GetNullableDouble(alignment, "markerLatencyMilliseconds"),
-            alignment.GetProperty("trimmedFrameCount").GetInt64(),
-            alignment.GetProperty("targetFrameCount").GetInt64());
+            outputPath,
+            GetRequiredInt64(output, "fileSize", 1, long.MaxValue),
+            channelCount,
+            bitDepth,
+            GetRequiredFiniteDouble(
+                output,
+                "sampleRate",
+                CaptureLimits.MinimumSampleRate,
+                CaptureLimits.MaximumSampleRate),
+            GetRequiredFiniteDouble(element, "elapsedSeconds", 0, 7 * 24 * 60 * 60),
+            GetNullableInt64Strict(alignment, "markerLatencyFrames"),
+            GetNullableFiniteDouble(alignment, "markerLatencyMilliseconds", -3_600_000, 3_600_000),
+            trimmedFrames,
+            targetFrames,
+            []);
     }
 
     private static CaptureWorkerException ParseError(JsonElement element)
@@ -373,11 +479,18 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
                 channel.GetProperty("name").GetString() ?? string.Empty))
             .ToArray();
 
-    private static IReadOnlyList<DiagnosticInfo> ParseDiagnostics(JsonElement element, string propertyName)
+    private static IReadOnlyList<DiagnosticInfo> ParseDiagnostics(
+        JsonElement element,
+        string propertyName,
+        bool required = false)
     {
         if (!element.TryGetProperty(propertyName, out var diagnostics)
             || diagnostics.ValueKind != JsonValueKind.Array)
         {
+            if (required)
+            {
+                throw ProtocolError($"A worker message has no '{propertyName}' array.");
+            }
             return [];
         }
         return diagnostics.EnumerateArray()
@@ -397,7 +510,9 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
             : null;
 
     private static double GetDouble(JsonElement element, string propertyName)
-        => element.TryGetProperty(propertyName, out var property) && property.TryGetDouble(out var value)
+        => element.TryGetProperty(propertyName, out var property)
+            && property.TryGetDouble(out var value)
+            && double.IsFinite(value)
             ? value
             : 0;
 
@@ -405,6 +520,7 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
         => element.TryGetProperty(propertyName, out var property)
             && property.ValueKind == JsonValueKind.Number
             && property.TryGetDouble(out var value)
+            && double.IsFinite(value)
             ? value
             : null;
 
@@ -415,8 +531,139 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
             ? value
             : null;
 
+    private static JsonElement GetRequiredObject(JsonElement element, string propertyName)
+        => element.TryGetProperty(propertyName, out var property)
+            && property.ValueKind == JsonValueKind.Object
+            ? property
+            : throw ProtocolError($"A worker message has no '{propertyName}' object.");
+
+    private static string GetRequiredString(JsonElement element, string propertyName)
+        => GetString(element, propertyName)
+            ?? throw ProtocolError($"A worker message has no string '{propertyName}' field.");
+
+    private static bool GetRequiredBoolean(JsonElement element, string propertyName)
+        => element.TryGetProperty(propertyName, out var property)
+            && property.ValueKind is JsonValueKind.True or JsonValueKind.False
+            ? property.GetBoolean()
+            : throw ProtocolError($"A worker message has no boolean '{propertyName}' field.");
+
+    private static double GetRequiredFiniteDouble(
+        JsonElement element,
+        string propertyName,
+        double minimum,
+        double maximum)
+    {
+        if (!element.TryGetProperty(propertyName, out var property)
+            || !property.TryGetDouble(out var value)
+            || !double.IsFinite(value)
+            || value < minimum
+            || value > maximum)
+        {
+            throw ProtocolError($"The worker returned an invalid '{propertyName}' value.");
+        }
+        return value;
+    }
+
+    private static double? GetNullableFiniteDouble(
+        JsonElement element,
+        string propertyName,
+        double minimum,
+        double maximum)
+    {
+        if (!element.TryGetProperty(propertyName, out var property)
+            || property.ValueKind == JsonValueKind.Null)
+        {
+            return null;
+        }
+        if (!property.TryGetDouble(out var value)
+            || !double.IsFinite(value)
+            || value < minimum
+            || value > maximum)
+        {
+            throw ProtocolError($"The worker returned an invalid '{propertyName}' value.");
+        }
+        return value;
+    }
+
+    private static int GetRequiredInt32(
+        JsonElement element,
+        string propertyName,
+        int minimum,
+        int maximum)
+    {
+        if (!element.TryGetProperty(propertyName, out var property)
+            || !property.TryGetInt32(out var value)
+            || value < minimum
+            || value > maximum)
+        {
+            throw ProtocolError($"The worker returned an invalid '{propertyName}' value.");
+        }
+        return value;
+    }
+
+    private static long GetRequiredInt64(
+        JsonElement element,
+        string propertyName,
+        long minimum,
+        long maximum)
+    {
+        if (!element.TryGetProperty(propertyName, out var property)
+            || !property.TryGetInt64(out var value)
+            || value < minimum
+            || value > maximum)
+        {
+            throw ProtocolError($"The worker returned an invalid '{propertyName}' value.");
+        }
+        return value;
+    }
+
+    private static long? GetNullableInt64Strict(JsonElement element, string propertyName)
+    {
+        if (!element.TryGetProperty(propertyName, out var property)
+            || property.ValueKind == JsonValueKind.Null)
+        {
+            return null;
+        }
+        return property.TryGetInt64(out var value)
+            ? value
+            : throw ProtocolError($"The worker returned an invalid '{propertyName}' value.");
+    }
+
     private static CaptureWorkerException ProtocolError(string message)
         => new("protocol_error", message);
+
+    private static async Task<bool> WaitForExitBoundedAsync(Process process)
+    {
+        try
+        {
+            if (process.HasExited)
+            {
+                return true;
+            }
+            using var timeout = new CancellationTokenSource(WorkerTerminationTimeout);
+            await process.WaitForExitAsync(timeout.Token).ConfigureAwait(false);
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return true;
+        }
+        catch (OperationCanceledException)
+        {
+            return false;
+        }
+    }
+
+    private static async Task ObserveStandardErrorCompletionAsync(Task<string> standardErrorTask)
+    {
+        try
+        {
+            _ = await standardErrorTask.WaitAsync(WorkerTerminationTimeout).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+        }
+    }
 
     private static void TryTerminate(Process process)
     {

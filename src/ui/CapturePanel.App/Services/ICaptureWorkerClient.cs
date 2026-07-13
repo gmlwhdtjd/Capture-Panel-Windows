@@ -22,8 +22,12 @@ public interface ICaptureWorkerClient
         CancellationToken cancellationToken);
 }
 
-public sealed class CaptureWorkerException(string code, string message, int? exitCode = null)
-    : Exception(message)
+public sealed class CaptureWorkerException(
+    string code,
+    string message,
+    int? exitCode = null,
+    Exception? innerException = null)
+    : Exception(message, innerException)
 {
     public string Code { get; } = code;
     public int? ExitCode { get; } = exitCode;

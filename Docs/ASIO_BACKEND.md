@@ -10,15 +10,19 @@ asio:{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}
 ```
 
 Unavailable registrations remain visible with their initialization diagnostic.
-This distinguishes “installed but disconnected or busy” from “not installed.”
+This distinguishes "installed but disconnected or busy" from "not installed."
 Capture Panel is x64-only and does not enumerate 32-bit-only COM servers.
 
 ## Driver session
 
 Every operation creates the driver on its calling control thread in an STA COM
-apartment and supplies a hidden top-level `HWND` to `IASIO::init`. Capture
-keeps that thread alive and pumps Windows messages until streaming finishes.
-The same thread stops, disposes, and releases the driver.
+apartment and supplies a hidden top-level `HWND` to `IASIO::init`. Capture keeps
+that thread alive and pumps Windows messages until streaming finishes. The same
+thread stops, disposes, and releases the driver.
+
+All public operations that touch a driver share a process-wide session lease.
+This covers probing and sample-rate changes as well as streaming; same-thread
+re-entry fails immediately instead of deadlocking.
 
 The implementation calls the `IASIO` COM vtable directly and does not use the
 SDK's legacy global host helpers.
@@ -50,24 +54,31 @@ stream starts.
 
 ## Buffer timeline and real-time path
 
-After `createBuffers`, both output halves are cleared. Output half B (index 1)
-is then filled with the first logical block before `start`, as required by the
-ASIO double-buffer timeline. The first input A callback is invalid and is
-skipped without advancing the recorded cursor. Subsequent callbacks write the
-next output block and read the current input block. Once playback ends, output
+Before `createBuffers`, a playback worker fills a bounded SPSC ring with at
+least four driver blocks or approximately a quarter second of audio. After
+`createBuffers`, both output halves are cleared. Output half B (index 1) is then
+filled with the first logical block before `start`, as required by the ASIO
+double-buffer timeline. The first input A callback is invalid and is skipped
+without advancing the recorded cursor. Subsequent callbacks write the next
+output block and read the current input block. Once playback ends, output
 buffers remain zero while input drains. The backend stops only after the
 requested recorded frame count is complete.
 
-Before `start`, Capture Panel allocates the complete recorded buffer, playback
-scratch block, descriptors, and conversion views. The callback only:
+Before `start`, Capture Panel allocates both SPSC rings, callback scratch blocks,
+descriptors, and conversion views. The callback only:
 
-1. writes a selected output half from preallocated memory;
-2. converts a selected input half into the preallocated recording;
-3. publishes progress and driver events through lock-free atomics;
+1. reads one exact playback block from the playback ring and writes a selected
+   output half from preallocated memory;
+2. converts a selected input half into preallocated scratch and writes one exact
+   block to the recording ring;
+3. publishes progress and driver events through lock-free atomics; and
 4. calls `outputReady` when the driver reports support.
 
 The callback never allocates, locks, logs, performs file I/O, invokes a progress
-handler, or throws.
+handler, or throws. A separate writer drains the recording ring into a
+create-new temporary Float32 file and computes the raw peak while writing. See
+[Streaming Audio Architecture](STREAMING_AUDIO_ARCHITECTURE.md) for the full
+data flow and ownership rules.
 
 ## Control path and failures
 
@@ -75,10 +86,19 @@ The control loop pumps the host window and polls callback state. Timeout is
 `max(10 seconds, requested duration + 5 seconds)`. Cancellation uses the core
 cancellation token.
 
-A reset request, resync request, sample-rate change, overload, invalid buffer
-index, reentrant callback, or conversion failure stops and disposes the stream
-before returning a `CaptureError`. A latency-change notice is refetched on the
-control thread. The driver's preferred buffer size is used.
+A playback underflow, recording overflow, source-read failure, temporary-file
+write/close failure, reset request, resync request, sample-rate change, overload,
+invalid buffer index, reentrant callback, or conversion failure stops and
+disposes the stream before returning a `CaptureError`. A latency-change notice
+is refetched on the control thread. The driver's preferred buffer size is used.
+
+Because ASIO callbacks have no host context pointer, their target is published
+through a lock-free reader gate. Every cleanup path stops the stream, closes the
+gate and waits for readers, wakes and joins both stream workers, then disposes
+buffers. A successful path lets the writer drain the final published callback
+block and close the scratch file before joining. Cleanup is armed before
+`createBuffers` and `start`, so a driver that partially succeeds before
+returning an error cannot leave host buffers active.
 
 The source sample rate is applied before capture and verified by reading it
 back. Capture orchestration restores the previous rate on a best-effort basis.
@@ -91,6 +111,10 @@ On 2026-07-10, Darkglass USB Audio 5.72.0 exposed 3 inputs, 9 outputs, and
 48 kHz. Three Debug and four Release low-level output 9 -> input 1 verification
 passes completed with no warnings or failures. Measured marker latency ranged
 from 312 to 348 frames (6.50 to 7.25 ms).
+
+This record predates the bounded-ring streaming refactor. Deterministic tests
+cover its data flow and teardown; a new physical-device pass remains a release
+gate.
 
 ## SDK and licensing
 

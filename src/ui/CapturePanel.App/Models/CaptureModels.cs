@@ -1,5 +1,11 @@
 namespace CapturePanel.App.Models;
 
+public static class CaptureLimits
+{
+    public const double MinimumSampleRate = 1_000;
+    public const double MaximumSampleRate = 768_000;
+}
+
 public sealed record DiagnosticInfo(string Code, string Message);
 
 public sealed record WorkerProgress(
@@ -47,7 +53,8 @@ public sealed record CaptureCompleted(
     long? LatencyFrames,
     double? LatencyMilliseconds,
     long TrimmedFrames,
-    long TargetFrames);
+    long TargetFrames,
+    IReadOnlyList<DiagnosticInfo> Warnings);
 
 public enum CaptureStabilityLevel
 {

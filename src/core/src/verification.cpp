@@ -1,12 +1,16 @@
 #include "capture_panel/core/verification.hpp"
 
+#include "capture_panel/core/errors.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <limits>
 #include <numeric>
 #include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -24,8 +28,57 @@ struct CorrelationMatch {
     return std::pow(10.0, dbfs / 20.0);
 }
 
-[[nodiscard]] Frame frame_count(double seconds, double sample_rate) {
-    return std::max<Frame>(1, static_cast<Frame>(std::llround(seconds * sample_rate)));
+void validate_verification_sample_rate(const double sample_rate) {
+    if (!std::isfinite(sample_rate)
+        || sample_rate < constants::audio::minimum_supported_sample_rate
+        || sample_rate > constants::audio::maximum_supported_sample_rate) {
+        throw CaptureError(
+            ErrorCode::unsupported_sample_rate,
+            "Verification sample rate must be between "
+                + std::to_string(constants::audio::minimum_supported_sample_rate)
+                + " and "
+                + std::to_string(constants::audio::maximum_supported_sample_rate)
+                + " Hz.");
+    }
+}
+
+[[nodiscard]] Frame frame_count(const double seconds, const double sample_rate) {
+    const auto frames = seconds * sample_rate;
+    if (!std::isfinite(frames) || frames < 0.0
+        || frames > static_cast<double>(std::numeric_limits<Frame>::max())) {
+        throw CaptureError(
+            ErrorCode::validation_failed,
+            "Verification signal frame count is outside the supported range.");
+    }
+    return std::max<Frame>(1, static_cast<Frame>(std::llround(frames)));
+}
+
+[[nodiscard]] Frame checked_frame_sum(
+    const Frame left,
+    const Frame right) {
+    if (left < 0 || right < 0 || left > std::numeric_limits<Frame>::max() - right) {
+        throw CaptureError(
+            ErrorCode::validation_failed,
+            "Verification signal duration is too large.");
+    }
+    return left + right;
+}
+
+[[nodiscard]] std::size_t checked_sample_count(
+    const Frame frames,
+    const std::uint32_t channels) {
+    if (frames < 0 || channels == 0) {
+        throw CaptureError(
+            ErrorCode::validation_failed,
+            "Verification signal dimensions are invalid.");
+    }
+    const auto frame_count = static_cast<std::uint64_t>(frames);
+    if (frame_count > std::numeric_limits<std::size_t>::max() / channels) {
+        throw CaptureError(
+            ErrorCode::validation_failed,
+            "Verification signal sample count is too large.");
+    }
+    return static_cast<std::size_t>(frame_count) * channels;
 }
 
 [[nodiscard]] double fade_envelope(
@@ -78,26 +131,25 @@ void write_log_sweep(
     }
 }
 
-[[nodiscard]] std::vector<double> mono_samples(
+[[nodiscard]] std::vector<double> channel_samples(
     const std::vector<float>& samples,
-    std::uint32_t channel_count,
-    AudioFrameRange frame_range) {
-    if (channel_count == 0 || frame_range.empty()) return {};
-    std::vector<double> mono;
-    mono.reserve(static_cast<std::size_t>(frame_range.size()));
-    for (auto frame = frame_range.lower_bound; frame < frame_range.upper_bound; ++frame) {
-        double sum = 0.0;
-        std::size_t count = 0;
-        for (std::uint32_t channel = 0; channel < channel_count; ++channel) {
-            const auto index = frame * static_cast<Frame>(channel_count)
-                + static_cast<Frame>(channel);
-            if (index < 0 || index >= static_cast<Frame>(samples.size())) continue;
-            sum += static_cast<double>(samples[static_cast<std::size_t>(index)]);
-            ++count;
-        }
-        mono.push_back(count > 0 ? sum / static_cast<double>(count) : 0.0);
+    const std::uint32_t channel_count,
+    const std::uint32_t selected_channel,
+    const AudioFrameRange frame_range) {
+    if (channel_count == 0 || selected_channel >= channel_count || frame_range.empty()) {
+        return {};
     }
-    return mono;
+
+    std::vector<double> selected;
+    selected.reserve(static_cast<std::size_t>(frame_range.size()));
+    for (auto frame = frame_range.lower_bound; frame < frame_range.upper_bound; ++frame) {
+        const auto index = frame * static_cast<Frame>(channel_count)
+            + static_cast<Frame>(selected_channel);
+        selected.push_back(index >= 0 && index < static_cast<Frame>(samples.size())
+            ? static_cast<double>(samples[static_cast<std::size_t>(index)])
+            : 0.0);
+    }
+    return selected;
 }
 
 [[nodiscard]] double normalized_correlation(
@@ -171,18 +223,12 @@ void write_log_sweep(
     };
 }
 
-[[nodiscard]] std::optional<VerificationSweepResult> match_sweep(
-    const AudioBuffer& aligned,
-    Frame aligned_frame_count,
+[[nodiscard]] Frame timing_tolerance_frames(double sample_rate);
+
+[[nodiscard]] std::optional<VerificationSweepResult> match_sweep_channel(
+    const std::vector<double>& recorded,
+    const std::vector<double>& reference,
     const VerificationSignal& signal) {
-    const auto recorded = mono_samples(
-        aligned.samples,
-        aligned.channel_count,
-        AudioFrameRange{.lower_bound = 0, .upper_bound = aligned_frame_count});
-    const auto reference = mono_samples(
-        signal.audio.samples,
-        signal.channel_count,
-        signal.sweep_frame_range);
     if (recorded.empty() || reference.empty() || recorded.size() < reference.size()) {
         return std::nullopt;
     }
@@ -271,6 +317,92 @@ void write_log_sweep(
         .ambiguity_ratio = ambiguity_ratio,
         .reliability = reliability,
     };
+}
+
+[[nodiscard]] int reliability_rank(const VerificationReliability reliability) noexcept {
+    switch (reliability) {
+    case VerificationReliability::reliable:
+        return 2;
+    case VerificationReliability::ambiguous:
+        return 1;
+    case VerificationReliability::unmeasurable:
+        return 0;
+    }
+    return 0;
+}
+
+[[nodiscard]] bool has_acceptable_timing(
+    const VerificationSweepResult& result,
+    const Frame tolerance) noexcept {
+    return result.reliability != VerificationReliability::unmeasurable
+        && result.error_frames.has_value()
+        && std::abs(*result.error_frames) <= tolerance;
+}
+
+[[nodiscard]] bool is_better_channel_match(
+    const VerificationSweepResult& candidate,
+    const VerificationSweepResult& current,
+    const Frame timing_tolerance) noexcept {
+    const auto candidate_timing = has_acceptable_timing(candidate, timing_tolerance);
+    const auto current_timing = has_acceptable_timing(current, timing_tolerance);
+    if (candidate_timing != current_timing) return candidate_timing;
+
+    const auto score_difference = candidate.direct_score - current.direct_score;
+    if (std::abs(score_difference)
+        > constants::verification_sweep::minimum_direct_score) {
+        return score_difference > 0.0;
+    }
+
+    // Reliability breaks a near tie, but cannot let a barely measurable noise
+    // coincidence replace substantially stronger sweep evidence merely because
+    // the stronger channel also exposes a delayed echo.
+    const auto candidate_reliability = reliability_rank(candidate.reliability);
+    const auto current_reliability = reliability_rank(current.reliability);
+    if (candidate_reliability != current_reliability) {
+        return candidate_reliability > current_reliability;
+    }
+    if (std::abs(score_difference) > 1.0e-12) {
+        return score_difference > 0.0;
+    }
+    const auto candidate_error = candidate.error_frames.has_value()
+        ? std::abs(*candidate.error_frames)
+        : std::numeric_limits<Frame>::max();
+    const auto current_error = current.error_frames.has_value()
+        ? std::abs(*current.error_frames)
+        : std::numeric_limits<Frame>::max();
+    return candidate_error < current_error;
+}
+
+[[nodiscard]] std::optional<VerificationSweepResult> match_sweep(
+    const AudioBuffer& aligned,
+    const Frame aligned_frame_count,
+    const VerificationSignal& signal) {
+    const auto reference = channel_samples(
+        signal.audio.samples,
+        signal.channel_count,
+        0,
+        signal.sweep_frame_range);
+    if (reference.empty() || aligned.channel_count == 0 || aligned_frame_count <= 0) {
+        return std::nullopt;
+    }
+
+    const auto recorded_range = AudioFrameRange{
+        .lower_bound = 0,
+        .upper_bound = aligned_frame_count,
+    };
+    const auto tolerance = timing_tolerance_frames(signal.format.sample_rate);
+    std::optional<VerificationSweepResult> best;
+    for (std::uint32_t channel = 0; channel < aligned.channel_count; ++channel) {
+        const auto recorded = channel_samples(
+            aligned.samples, aligned.channel_count, channel, recorded_range);
+        const auto candidate = match_sweep_channel(recorded, reference, signal);
+        if (candidate.has_value()
+            && (!best.has_value()
+                || is_better_channel_match(*candidate, *best, tolerance))) {
+            best = *candidate;
+        }
+    }
+    return best;
 }
 
 [[nodiscard]] double peak(const std::vector<float>& samples) {
@@ -395,49 +527,62 @@ VerificationSignal make_verification_signal(
     double sample_rate,
     std::uint32_t channel_count,
     double level_dbfs) {
-    const auto safe_channel_count = std::max<std::uint32_t>(1, channel_count);
-    const auto safe_sample_rate = sample_rate > 0.0
-        ? sample_rate
-        : constants::audio::fallback_sample_rate;
+    validate_verification_sample_rate(sample_rate);
+    if (channel_count == 0
+        || channel_count > constants::verification_signal::maximum_channel_count) {
+        throw CaptureError(
+            ErrorCode::validation_failed,
+            "Verification signal channel count is outside the supported range.");
+    }
+    if (!std::isfinite(level_dbfs)) {
+        throw CaptureError(
+            ErrorCode::validation_failed,
+            "Verification signal level must be finite.");
+    }
+    const auto amplitude = linear_from_dbfs(level_dbfs);
+    if (!std::isfinite(amplitude)) {
+        throw CaptureError(
+            ErrorCode::validation_failed,
+            "Verification signal level is outside the supported range.");
+    }
     const auto leading_silence_frames = frame_count(
         constants::verification_signal::leading_silence_seconds,
-        safe_sample_rate);
+        sample_rate);
     const auto sweep_frames = frame_count(
         constants::verification_signal::sweep_seconds,
-        safe_sample_rate);
+        sample_rate);
     const auto trailing_silence_frames = frame_count(
         constants::verification_signal::trailing_silence_seconds,
-        safe_sample_rate);
+        sample_rate);
+    const auto sweep_end = checked_frame_sum(leading_silence_frames, sweep_frames);
     const auto sweep_range = AudioFrameRange{
         .lower_bound = leading_silence_frames,
-        .upper_bound = leading_silence_frames + sweep_frames,
+        .upper_bound = sweep_end,
     };
-    const auto total_frames = leading_silence_frames + sweep_frames
-        + trailing_silence_frames;
+    const auto total_frames = checked_frame_sum(sweep_end, trailing_silence_frames);
     AudioBuffer audio{
-        .sample_rate = safe_sample_rate,
-        .channel_count = safe_channel_count,
+        .sample_rate = sample_rate,
+        .channel_count = channel_count,
         .samples = std::vector<float>(
-            static_cast<std::size_t>(total_frames)
-                * static_cast<std::size_t>(safe_channel_count),
+            checked_sample_count(total_frames, channel_count),
             0.0F),
     };
     write_log_sweep(
         audio.samples,
         sweep_range,
-        safe_channel_count,
-        safe_sample_rate,
-        linear_from_dbfs(level_dbfs));
+        channel_count,
+        sample_rate,
+        amplitude);
 
     return VerificationSignal{
         .audio = std::move(audio),
         .format = WavFormat{
-            .sample_rate = safe_sample_rate,
-            .channel_count = safe_channel_count,
+            .sample_rate = sample_rate,
+            .channel_count = channel_count,
             .bit_depth = AudioBitDepth::pcm24,
             .total_frames = total_frames,
         },
-        .channel_count = safe_channel_count,
+        .channel_count = channel_count,
         .leading_silence_frame_range = AudioFrameRange{
             .lower_bound = 0,
             .upper_bound = leading_silence_frames,

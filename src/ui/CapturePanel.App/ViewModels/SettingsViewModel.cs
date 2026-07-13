@@ -21,6 +21,7 @@ public sealed class SettingsViewModel : ObservableObject
     }
 
     public string VersionText { get; }
+    public event EventHandler<string>? ErrorRaised;
     public string WorkerPath { get; }
     public bool WorkerAvailable => File.Exists(WorkerPath);
     public string WorkerStatusText => WorkerAvailable ? "Bundled worker available" : "Bundled worker missing";
@@ -34,14 +35,28 @@ public sealed class SettingsViewModel : ObservableObject
     private static bool BundledFileExists(string relativePath)
         => File.Exists(Path.Combine(AppContext.BaseDirectory, relativePath));
 
-    private static void OpenBundledFile(string relativePath)
+    private void OpenBundledFile(string relativePath)
     {
         var path = Path.Combine(AppContext.BaseDirectory, relativePath);
-        if (!File.Exists(path))
+        try
         {
-            return;
-        }
+            if (!File.Exists(path))
+            {
+                ErrorRaised?.Invoke(this, $"The bundled file is missing: {relativePath}");
+                return;
+            }
 
-        Process.Start(new ProcessStartInfo(path) { UseShellExecute = true });
+            if (Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }) is null)
+            {
+                ErrorRaised?.Invoke(this, $"Windows could not open {Path.GetFileName(path)}.");
+            }
+        }
+        catch (Exception exception) when (exception is InvalidOperationException
+            or IOException
+            or UnauthorizedAccessException
+            or System.ComponentModel.Win32Exception)
+        {
+            ErrorRaised?.Invoke(this, $"Could not open {Path.GetFileName(path)}: {exception.Message}");
+        }
     }
 }
