@@ -95,10 +95,9 @@ unset so the Shell owns scaling.
 The release workflow performs a self-contained, untrimmed `win-x64` WPF folder
 publish. The binary ZIP has `CapturePanel.exe` and `capture-panel.exe` in the
 same directory, followed by the .NET runtime files, `LICENSE`,
-`THIRD_PARTY_NOTICES.md`, the Steinberg SDK license, and project documentation.
-The package also preserves the .NET and Windows Desktop Runtime licenses and
-third-party notices selected by the self-contained publish. The corresponding
-tagged source ZIP and `SHA256SUMS` are separate release assets. Hardware vendor
+`THIRD_PARTY_NOTICES.md`, and the required Steinberg and .NET runtime licenses
+and notices. Developer documentation remains in the separately published exact
+tagged source ZIP. `SHA256SUMS` is a separate release asset. Hardware vendor
 drivers are never copied into build or publish output.
 
 ## Development rules

@@ -132,7 +132,6 @@ jobs:
           Copy-Item -LiteralPath '.\README.md' -Destination $stage -Force
           Copy-Item -LiteralPath '.\LICENSE' -Destination $stage -Force
           Copy-Item -LiteralPath '.\THIRD_PARTY_NOTICES.md' -Destination $stage -Force
-          Copy-Item -LiteralPath '.\Docs' -Destination $stage -Recurse -Force
           Copy-Item -LiteralPath '.\third_party\asio\LICENSE.txt' `
             -Destination (Join-Path $stage 'licenses\Steinberg-ASIO-SDK-LICENSE.txt') -Force
           Copy-Item -LiteralPath (Join-Path $coreRuntimeLicenseRoot 'LICENSE.TXT') `

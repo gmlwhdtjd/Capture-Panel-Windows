@@ -17,7 +17,7 @@ inline constexpr std::size_t minimum_impulses_for_analysis = 2;
 
 namespace alignment {
 inline constexpr double padding_seconds = 0.5;
-inline constexpr double marker_to_payload_silence_seconds = 5.0;
+inline constexpr double marker_to_payload_silence_seconds = 2.0;
 inline constexpr std::size_t impulse_count = 5;
 inline constexpr double impulse_interval_seconds = 0.1;
 inline constexpr double impulse_level_dbfs = -12.0;

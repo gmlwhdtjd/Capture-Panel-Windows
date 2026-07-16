@@ -39,17 +39,17 @@ CP_TEST_CASE("alignment playback plan preserves marker preamble and payload plac
     const auto audio = materialize_playback_plan(plan);
 
     CP_REQUIRE(plan.marker_frames == std::vector<std::int64_t>({0, 100, 200, 300, 400}));
-    CP_REQUIRE(plan.source_start_frame == 5'400);
-    CP_REQUIRE(plan.playback_frame_count == 5'403);
-    CP_REQUIRE(audio.frame_count() == 5'403);
+    CP_REQUIRE(plan.source_start_frame == 2'400);
+    CP_REQUIRE(plan.playback_frame_count == 2'403);
+    CP_REQUIRE(audio.frame_count() == 2'403);
     const auto marker_amplitude = std::pow(10.0, -12.0 / 20.0);
     CP_REQUIRE_NEAR(audio.samples[0], marker_amplitude, 1.0e-6);
     CP_REQUIRE_NEAR(audio.samples[100], marker_amplitude, 1.0e-6);
     CP_REQUIRE_NEAR(audio.samples[400], marker_amplitude, 1.0e-6);
     CP_REQUIRE_NEAR(audio.samples[401], 0.0, 1.0e-9);
-    CP_REQUIRE_NEAR(audio.samples[5'400], 0.25, 1.0e-6);
-    CP_REQUIRE_NEAR(audio.samples[5'401], -0.5, 1.0e-6);
-    CP_REQUIRE_NEAR(audio.samples[5'402], 0.75, 1.0e-6);
+    CP_REQUIRE_NEAR(audio.samples[2'400], 0.25, 1.0e-6);
+    CP_REQUIRE_NEAR(audio.samples[2'401], -0.5, 1.0e-6);
+    CP_REQUIRE_NEAR(audio.samples[2'402], 0.75, 1.0e-6);
 }
 
 CP_TEST_CASE("alignment playback gain applies equally to markers and payload") {
@@ -62,8 +62,8 @@ CP_TEST_CASE("alignment playback gain applies equally to markers and payload") {
         audio.samples[0],
         std::pow(10.0, -12.0 / 20.0) * gain,
         1.0e-6);
-    CP_REQUIRE_NEAR(audio.samples[5'400], source.samples[0] * gain, 1.0e-6);
-    CP_REQUIRE_NEAR(audio.samples[5'401], source.samples[1] * gain, 1.0e-6);
+    CP_REQUIRE_NEAR(audio.samples[2'400], source.samples[0] * gain, 1.0e-6);
+    CP_REQUIRE_NEAR(audio.samples[2'401], source.samples[1] * gain, 1.0e-6);
 }
 
 CP_TEST_CASE("marker matcher ignores extra candidates before the marker train") {
