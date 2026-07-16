@@ -1,0 +1,65 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="256"
+     height="256"
+     viewBox="0 0 256 256"
+     fill="none"
+     shape-rendering="geometricPrecision">
+  <title>Capture Panel for Windows</title>
+  <desc>
+    A flat 45-degree gradient icon with a rounded-square background filling
+    the complete 256 px canvas.
+  </desc>
+
+  <defs>
+    <linearGradient id="tile-gradient"
+                    x1="0"
+                    y1="0"
+                    x2="256"
+                    y2="256"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#353535"/>
+      <stop offset="0.38" stop-color="#2F2F2F"/>
+      <stop offset="1" stop-color="#1B1B1B"/>
+    </linearGradient>
+    <linearGradient id="symbol-gradient"
+                    x1="145"
+                    y1="145"
+                    x2="875"
+                    y2="875"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#E83B30"/>
+      <stop offset="0.48" stop-color="#C93229"/>
+      <stop offset="1" stop-color="#9A2723"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="256" height="256" rx="53" fill="url(#tile-gradient)"/>
+
+  <!-- macOS commit 27961c0: orbit 103%, center disc 110%. -->
+  <g transform="matrix(0.2885376 0 0 0.2885376 -19.7312512 -19.7312512)"
+     fill="url(#symbol-gradient)">
+    <g transform="translate(512 512) scale(1.03) translate(-512 -512)">
+      <path d="m843.82634957,646.37663058
+               a358,358 0 1 1 25.33303662,-161.52105478
+               a36,36 0 0 1 -71.79952365,5.381127
+               a286,286 0 1 0 -20.23660286,129.03613318
+               a36,36 0 0 1 66.70308989,27.1037946
+               z"/>
+      <path d="m744.2363933,449.06628742
+               c10.80791715,-11.10041481 24.16148131,-6.48269334 28.8135075,-5.26465688
+               l52.93306983,18.54001428
+               l52.25378726,-20.37605771
+               c4.60662346,-1.3796468 17.79095683,-6.46058899 28.97968897,4.25587288
+               c12.20688854,11.69176113 12.5184646,29.54194205 1.72689645,41.63514274
+               l-60.86739253,65.54327503
+               c-10.79058725,12.09324358 -29.78861333,12.42485535 -40.99467536,0.71556472
+               l-63.11768107,-63.37910752
+               c-11.20710083,-11.70921249 -11.5186769,-29.55939341 0.27279894,-41.67004755
+               z"/>
+    </g>
+    <circle cx="512"
+            cy="512"
+            r="121"
+            transform="translate(512 512) scale(1.1) translate(-512 -512)"/>
+  </g>
+</svg>

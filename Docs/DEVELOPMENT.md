@@ -77,6 +77,19 @@ $env:CAPTURE_PANEL_SHOW_FAKE = '1'
 The native CLI remains independently usable from
 `out\build\windows-x64\bin\<Configuration>\capture-panel.exe`.
 
+## Windows icon assets
+
+`assets/windows/CapturePanel.svg` is the editable master,
+`CapturePanel.ico` is the checked-in Windows Shell asset, and
+`CapturePanel.png` is its 256-pixel in-app representation. The SVG is authored
+directly on a tightly fitted 256-pixel canvas and rendered with an antialiased
+SVG converter. The approved artwork uses a rounded-square background and
+upper-left-to-lower-right 45-degree gradients; alternate icon variants and
+generated previews are not kept in the repository. The ICO contains one
+PNG-compressed 256-pixel 32-bit frame and lets Windows scale it for the
+requested DPI. It is embedded in both executables; WPF leaves `Window.Icon`
+unset so the Shell owns scaling.
+
 ## Publish layout
 
 The release workflow performs a self-contained, untrimmed `win-x64` WPF folder

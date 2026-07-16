@@ -11,7 +11,22 @@ if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "Capture Panel's ASIO host requires 64-bit Windows.")
 endif()
 
+enable_language(RC)
+
 option(CAPTURE_PANEL_BUILD_TESTS "Build Capture Panel tests" ON)
+
+set(CAPTURE_PANEL_WINDOWS_ICON "${CMAKE_CURRENT_SOURCE_DIR}/assets/windows/CapturePanel.ico")
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated")
+configure_file(
+    src/cli/capture-panel.rc.in
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/capture-panel.rc"
+    @ONLY
+)
+set(CAPTURE_PANEL_CLI_RESOURCE "${CMAKE_CURRENT_BINARY_DIR}/generated/capture-panel.rc")
+set_source_files_properties(
+    "${CAPTURE_PANEL_CLI_RESOURCE}"
+    PROPERTIES OBJECT_DEPENDS "${CAPTURE_PANEL_WINDOWS_ICON}"
+)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -122,6 +137,7 @@ capture_panel_enable_warnings(capture_panel_cli_lib)
 add_executable(capture-panel
     src/cli/main.cpp
     src/cli/app.manifest
+    "${CAPTURE_PANEL_CLI_RESOURCE}"
 )
 target_link_libraries(capture-panel PRIVATE capture_panel_cli_lib)
 capture_panel_enable_warnings(capture-panel)

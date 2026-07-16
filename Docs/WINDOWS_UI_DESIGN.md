@@ -233,6 +233,10 @@ The About window contains:
 - Steinberg ASIO SDK third-party notice;
 - buttons to open `LICENSE` and `THIRD_PARTY_NOTICES.md`.
 
+The About window is fixed at 560 x 528 device-independent pixels. It cannot be
+resized or maximized; its content remains inside a vertical ScrollViewer for
+text scaling and accessibility.
+
 Windows does not install a separate global CLI symlink, so the macOS Command
 Line Tool installer section is replaced by bundled-worker status. License
 actions use full-width native Windows command rows instead of a wrapping button

@@ -1,0 +1,5 @@
+#include <windows.h>
+
+#define IDI_CAPTURE_PANEL 101
+
+IDI_CAPTURE_PANEL ICON "@CAPTURE_PANEL_WINDOWS_ICON@"

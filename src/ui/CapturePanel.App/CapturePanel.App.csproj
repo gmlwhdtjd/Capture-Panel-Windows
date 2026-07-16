@@ -11,12 +11,15 @@
     <RootNamespace>CapturePanel.App</RootNamespace>
     <Version>0.1.0</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>$(MSBuildThisFileDirectory)..\..\..\assets\windows\CapturePanel.ico</ApplicationIcon>
     <OutputPath>$(MSBuildThisFileDirectory)..\..\..\out\dotnet\CapturePanel.App\$(Configuration)\</OutputPath>
     <IntermediateOutputPath>$(MSBuildThisFileDirectory)..\..\..\out\dotnet-obj\CapturePanel.App\$(Configuration)\</IntermediateOutputPath>
     <CapturePanelCliPath Condition="'$(CapturePanelCliPath)' == ''">$(MSBuildThisFileDirectory)..\..\..\out\build\windows-x64\bin\$(Configuration)\capture-panel.exe</CapturePanelCliPath>
   </PropertyGroup>
 
   <ItemGroup>
+    <Resource Include="$(MSBuildThisFileDirectory)..\..\..\assets\windows\CapturePanel.png"
+              Link="Assets\CapturePanel.png" />
     <None Include="$(CapturePanelCliPath)" Link="capture-panel.exe" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(CapturePanelCliPath)')" />
     <None Include="$(MSBuildThisFileDirectory)..\..\..\LICENSE" Link="LICENSE" CopyToOutputDirectory="PreserveNewest" />
     <None Include="$(MSBuildThisFileDirectory)..\..\..\THIRD_PARTY_NOTICES.md" Link="THIRD_PARTY_NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
