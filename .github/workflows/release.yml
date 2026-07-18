@@ -204,21 +204,6 @@ jobs:
             throw "Packaged worker version mismatch: expected '$expected', got '$packagedWorkerVersion'"
           }
 
-          $packagedUi = Join-Path $stage 'CapturePanel.exe'
-          $env:CAPTURE_PANEL_SHOW_FAKE = '1'
-          $uiProcess = Start-Process -FilePath $packagedUi -PassThru
-          try {
-            if ($uiProcess.WaitForExit(5000)) {
-              throw "Packaged UI exited during startup with code $($uiProcess.ExitCode)"
-            }
-          } finally {
-            if (-not $uiProcess.HasExited) {
-              Stop-Process -Id $uiProcess.Id -Force
-              $uiProcess.WaitForExit()
-            }
-            Remove-Item Env:CAPTURE_PANEL_SHOW_FAKE -ErrorAction SilentlyContinue
-          }
-
           function Assert-FlatDirectoryContents {
             param(
               [Parameter(Mandatory)] [string] $Directory,
@@ -262,6 +247,23 @@ jobs:
 
           $binaryZip = Join-Path $dist "$packageName.zip"
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $binaryZip
+
+          # Windows can retain an executable image lock briefly after a forced
+          # shutdown, so archive the untouched payload before smoke-starting it.
+          $packagedUi = Join-Path $stage 'CapturePanel.exe'
+          $env:CAPTURE_PANEL_SHOW_FAKE = '1'
+          $uiProcess = Start-Process -FilePath $packagedUi -PassThru
+          try {
+            if ($uiProcess.WaitForExit(5000)) {
+              throw "Packaged UI exited during startup with code $($uiProcess.ExitCode)"
+            }
+          } finally {
+            if (-not $uiProcess.HasExited) {
+              Stop-Process -Id $uiProcess.Id -Force
+              $uiProcess.WaitForExit()
+            }
+            Remove-Item Env:CAPTURE_PANEL_SHOW_FAKE -ErrorAction SilentlyContinue
+          }
 
           $sourceZip = Join-Path $dist "$packageName-source.zip"
           git archive --format=zip --prefix="$packageName-source/" `
