@@ -182,7 +182,7 @@ public sealed class CaptureWorkerClient : ICaptureWorkerClient
         var startInfo = new ProcessStartInfo
         {
             FileName = WorkerPath,
-            WorkingDirectory = AppContext.BaseDirectory,
+            WorkingDirectory = Path.GetDirectoryName(WorkerPath) ?? AppContext.BaseDirectory,
             UseShellExecute = false,
             CreateNoWindow = true,
             RedirectStandardOutput = true,

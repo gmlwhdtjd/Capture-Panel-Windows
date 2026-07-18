@@ -64,9 +64,25 @@ jobs:
             throw "Tag/version mismatch: tag '$tag', WPF project '$managedDeclared'"
           }
 
+          $builtUiDirectory = '.\out\dotnet\CapturePanel.App\Release\net10.0-windows\win-x64'
+          $builtUiAssembly = Join-Path $builtUiDirectory 'CapturePanel.dll'
+          $builtUiDeps = Join-Path $builtUiDirectory 'CapturePanel.deps.json'
+          if (-not (Test-Path -LiteralPath $builtUiAssembly) -or
+              -not (Test-Path -LiteralPath $builtUiDeps)) {
+            throw 'Release build did not produce the WPF assembly and dependency manifest'
+          }
+          $assemblyVersion = [System.Reflection.AssemblyName]::GetAssemblyName(
+            (Resolve-Path -LiteralPath $builtUiAssembly).Path).Version
+          $managedReported = '{0}.{1}.{2}' -f `
+            $assemblyVersion.Major, $assemblyVersion.Minor, $assemblyVersion.Build
+          if ($managedReported -ne $releaseVersion) {
+            throw "Tag/version mismatch: tag '$tag', WPF assembly '$managedReported'"
+          }
+
           dotnet restore $uiProject `
             --runtime win-x64 `
-            -p:SelfContained=true
+            -p:SelfContained=true `
+            -p:PublishSingleFile=true
           if ($LASTEXITCODE -ne 0) {
             throw 'WPF self-contained restore failed'
           }
@@ -79,30 +95,44 @@ jobs:
             --output $publish `
             -p:Version=$releaseVersion `
             -p:PublishTrimmed=false `
-            -p:PublishSingleFile=false
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:IncludeAllContentForSelfExtract=false `
+            -p:EnableCompressionInSingleFile=false `
+            -p:DebugType=None `
+            -p:DebugSymbols=false
           if ($LASTEXITCODE -ne 0) {
             throw 'WPF publish failed'
           }
 
           $uiExecutable = Join-Path $publish 'CapturePanel.exe'
-          $uiAssembly = Join-Path $publish 'CapturePanel.dll'
-          if (-not (Test-Path -LiteralPath $uiExecutable) -or
-              -not (Test-Path -LiteralPath $uiAssembly)) {
-            throw 'WPF publish did not produce CapturePanel.exe and CapturePanel.dll'
+          $publishBin = Join-Path $publish 'bin'
+          $publishDocs = Join-Path $publish 'docs'
+          $publishLicenses = Join-Path $publish 'licenses'
+          if (-not (Test-Path -LiteralPath $uiExecutable -PathType Leaf)) {
+            throw 'Single-file publish did not produce CapturePanel.exe'
           }
-          $assemblyVersion = [System.Reflection.AssemblyName]::GetAssemblyName(
-            (Resolve-Path -LiteralPath $uiAssembly).Path).Version
-          $managedReported = '{0}.{1}.{2}' -f `
-            $assemblyVersion.Major, $assemblyVersion.Minor, $assemblyVersion.Build
-          if ($managedReported -ne $releaseVersion) {
-            throw "Tag/version mismatch: tag '$tag', WPF assembly '$managedReported'"
+          $publishedFileVersion = [Version](Get-Item -LiteralPath $uiExecutable).VersionInfo.FileVersion
+          $publishedReported = '{0}.{1}.{2}' -f `
+            $publishedFileVersion.Major, $publishedFileVersion.Minor, $publishedFileVersion.Build
+          if ($publishedReported -ne $releaseVersion) {
+            throw "Tag/version mismatch: tag '$tag', published WPF app '$publishedReported'"
           }
 
-          # The WPF process launches this executable as its isolated ASIO worker.
-          Copy-Item -LiteralPath $exe -Destination (Join-Path $publish 'capture-panel.exe') -Force
+          $publishRootFiles = @(Get-ChildItem -LiteralPath $publish -File)
+          $publishRootDirectories = @(Get-ChildItem -LiteralPath $publish -Directory |
+            Select-Object -ExpandProperty Name | Sort-Object)
+          $expectedPublishDirectories = @('bin', 'docs', 'licenses') | Sort-Object
+          $publishDirectoryDifference = @(Compare-Object `
+            -ReferenceObject $expectedPublishDirectories `
+            -DifferenceObject $publishRootDirectories)
+          if ($publishRootFiles.Count -ne 1 -or
+              $publishRootFiles[0].Name -ne 'CapturePanel.exe' -or
+              $publishDirectoryDifference.Count -ne 0) {
+            throw 'Single-file publish root must contain only CapturePanel.exe, bin, docs, and licenses'
+          }
 
-          $deps = Get-Content -LiteralPath (Join-Path $publish 'CapturePanel.deps.json') `
-            -Raw | ConvertFrom-Json
+          $deps = Get-Content -LiteralPath $builtUiDeps -Raw | ConvertFrom-Json
           $runtimeLibraries = @($deps.libraries.PSObject.Properties.Name)
           $coreRuntimeLibrary = $runtimeLibraries |
             Where-Object { $_ -like 'runtimepack.Microsoft.NETCore.App.Runtime.win-x64/*' } |
@@ -125,27 +155,40 @@ jobs:
           $desktopRuntimeLicenseRoot = Join-Path $nugetPackages `
             "microsoft.windowsdesktop.app.runtime.win-x64\$desktopRuntimeVersion"
 
-          New-Item -ItemType Directory -Path $stage -Force | Out-Null
-          New-Item -ItemType Directory -Path (Join-Path $stage 'licenses') -Force | Out-Null
+          $stageBin = Join-Path $stage 'bin'
+          $stageDocs = Join-Path $stage 'docs'
+          $stageLicenses = Join-Path $stage 'licenses'
+          foreach ($directory in @($stageBin, $stageDocs, $stageLicenses)) {
+            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+          }
 
-          Copy-Item -Path (Join-Path $publish '*') -Destination $stage -Recurse -Force
-          Copy-Item -LiteralPath '.\README.md' -Destination $stage -Force
-          Copy-Item -LiteralPath '.\LICENSE' -Destination $stage -Force
-          Copy-Item -LiteralPath '.\THIRD_PARTY_NOTICES.md' -Destination $stage -Force
-          Copy-Item -LiteralPath '.\third_party\asio\LICENSE.txt' `
-            -Destination (Join-Path $stage 'licenses\Steinberg-ASIO-SDK-LICENSE.txt') -Force
+          Copy-Item -LiteralPath $uiExecutable -Destination $stage -Force
+          Copy-Item -Path (Join-Path $publishBin '*') `
+            -Destination $stageBin -Recurse -Force
+          Copy-Item -Path (Join-Path $publishDocs '*') `
+            -Destination $stageDocs -Recurse -Force
+          Copy-Item -Path (Join-Path $publishLicenses '*') `
+            -Destination $stageLicenses -Recurse -Force
           Copy-Item -LiteralPath (Join-Path $coreRuntimeLicenseRoot 'LICENSE.TXT') `
-            -Destination (Join-Path $stage 'licenses\dotnet-runtime-LICENSE.txt') -Force
+            -Destination (Join-Path $stageLicenses 'dotnet-runtime-LICENSE.txt') -Force
           Copy-Item -LiteralPath (Join-Path $coreRuntimeLicenseRoot 'THIRD-PARTY-NOTICES.TXT') `
-            -Destination (Join-Path $stage 'licenses\dotnet-runtime-THIRD-PARTY-NOTICES.txt') -Force
+            -Destination (Join-Path $stageLicenses 'dotnet-runtime-THIRD-PARTY-NOTICES.txt') -Force
           Copy-Item -LiteralPath (Join-Path $desktopRuntimeLicenseRoot 'LICENSE') `
-            -Destination (Join-Path $stage 'licenses\windows-desktop-runtime-LICENSE.txt') -Force
+            -Destination (Join-Path $stageLicenses 'windows-desktop-runtime-LICENSE.txt') -Force
+
+          $packagedReadme = Join-Path $stageDocs 'README.md'
+          $readmeText = [IO.File]::ReadAllText($packagedReadme)
+          if (-not $readmeText.Contains('../licenses/GPL-3.0.txt') -or
+              -not $readmeText.Contains('../licenses/THIRD_PARTY_NOTICES.md')) {
+            throw 'The packaged README does not link to the bundled legal files'
+          }
 
           foreach ($requiredFile in @(
               'CapturePanel.exe',
-              'capture-panel.exe',
-              'LICENSE',
-              'THIRD_PARTY_NOTICES.md',
+              'bin\capture-panel.exe',
+              'docs\README.md',
+              'licenses\GPL-3.0.txt',
+              'licenses\THIRD_PARTY_NOTICES.md',
               'licenses\Steinberg-ASIO-SDK-LICENSE.txt',
               'licenses\dotnet-runtime-LICENSE.txt',
               'licenses\dotnet-runtime-THIRD-PARTY-NOTICES.txt',
@@ -153,6 +196,68 @@ jobs:
             if (-not (Test-Path -LiteralPath (Join-Path $stage $requiredFile))) {
               throw "Release package is missing $requiredFile"
             }
+          }
+
+          $packagedWorker = Join-Path $stage 'bin\capture-panel.exe'
+          $packagedWorkerVersion = (& $packagedWorker --version).Trim()
+          if ($packagedWorkerVersion -ne $expected) {
+            throw "Packaged worker version mismatch: expected '$expected', got '$packagedWorkerVersion'"
+          }
+
+          $packagedUi = Join-Path $stage 'CapturePanel.exe'
+          $env:CAPTURE_PANEL_SHOW_FAKE = '1'
+          $uiProcess = Start-Process -FilePath $packagedUi -PassThru
+          try {
+            if ($uiProcess.WaitForExit(5000)) {
+              throw "Packaged UI exited during startup with code $($uiProcess.ExitCode)"
+            }
+          } finally {
+            if (-not $uiProcess.HasExited) {
+              Stop-Process -Id $uiProcess.Id -Force
+              $uiProcess.WaitForExit()
+            }
+            Remove-Item Env:CAPTURE_PANEL_SHOW_FAKE -ErrorAction SilentlyContinue
+          }
+
+          function Assert-FlatDirectoryContents {
+            param(
+              [Parameter(Mandatory)] [string] $Directory,
+              [Parameter(Mandatory)] [string[]] $ExpectedFiles
+            )
+
+            $actualFiles = @(Get-ChildItem -LiteralPath $Directory -File |
+              Select-Object -ExpandProperty Name | Sort-Object)
+            $expectedSorted = @($ExpectedFiles | Sort-Object)
+            $difference = @(Compare-Object `
+              -ReferenceObject $expectedSorted `
+              -DifferenceObject $actualFiles)
+            $subdirectories = @(Get-ChildItem -LiteralPath $Directory -Directory)
+            if ($difference.Count -ne 0 -or $subdirectories.Count -ne 0) {
+              throw "Unexpected release contents under $Directory"
+            }
+          }
+
+          Assert-FlatDirectoryContents $stageBin @('capture-panel.exe')
+          Assert-FlatDirectoryContents $stageDocs @('README.md')
+          Assert-FlatDirectoryContents $stageLicenses @(
+            'GPL-3.0.txt',
+            'THIRD_PARTY_NOTICES.md',
+            'Steinberg-ASIO-SDK-LICENSE.txt',
+            'dotnet-runtime-LICENSE.txt',
+            'dotnet-runtime-THIRD-PARTY-NOTICES.txt',
+            'windows-desktop-runtime-LICENSE.txt')
+
+          $stageRootFiles = @(Get-ChildItem -LiteralPath $stage -File)
+          $stageRootDirectories = @(Get-ChildItem -LiteralPath $stage -Directory |
+            Select-Object -ExpandProperty Name | Sort-Object)
+          $expectedStageDirectories = @('bin', 'docs', 'licenses') | Sort-Object
+          $stageDirectoryDifference = @(Compare-Object `
+            -ReferenceObject $expectedStageDirectories `
+            -DifferenceObject $stageRootDirectories)
+          if ($stageRootFiles.Count -ne 1 -or
+              $stageRootFiles[0].Name -ne 'CapturePanel.exe' -or
+              $stageDirectoryDifference.Count -ne 0) {
+            throw 'Release root must contain only CapturePanel.exe, bin, docs, and licenses'
           }
 
           $binaryZip = Join-Path $dist "$packageName.zip"
@@ -256,7 +361,7 @@ jobs:
             --repo $env:GITHUB_REPOSITORY `
             --verify-tag `
             --generate-notes `
-            --title "Capture Panel for Windows $env:GITHUB_REF_NAME"
+            --title $env:GITHUB_REF_NAME
           if ($LASTEXITCODE -ne 0) {
             throw 'GitHub release creation failed'
           }

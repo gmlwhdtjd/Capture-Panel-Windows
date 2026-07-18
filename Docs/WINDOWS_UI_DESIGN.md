@@ -231,7 +231,8 @@ The About window contains:
 - native worker path and availability;
 - `GNU GPL version 3 only` application license notice;
 - Steinberg ASIO SDK third-party notice;
-- buttons to open `LICENSE` and `THIRD_PARTY_NOTICES.md`.
+- buttons to open `licenses\GPL-3.0.txt` and
+  `licenses\THIRD_PARTY_NOTICES.md`.
 
 The About window is fixed at 560 x 528 device-independent pixels. It cannot be
 resized or maximized; its content remains inside a vertical ScrollViewer for
@@ -280,23 +281,29 @@ Manual UI validation covers:
 ## Build and distribution
 
 `build.ps1` builds the native C++ worker before the WPF project so the managed
-project can copy `capture-panel.exe` beside `CapturePanel.exe`. With `-Test`, it
-also runs both CTest and the dependency-free managed UI test executable.
+project can copy it to `bin\capture-panel.exe`. With `-Test`, it also runs
+both CTest and the dependency-free managed UI test executable.
 
-Debug application output:
+App-owned files in Debug output (the framework-dependent .NET runtime files are
+omitted here):
 
 ```text
 out/dotnet/CapturePanel.App/Debug/net10.0-windows/win-x64/
 |-- CapturePanel.exe
-|-- capture-panel.exe
-|-- LICENSE
-|-- THIRD_PARTY_NOTICES.md
-+-- licenses/Steinberg-ASIO-SDK-LICENSE.txt
+|-- bin/
+|   +-- capture-panel.exe
+|-- docs/
+|   +-- README.md
++-- licenses/
+    |-- GPL-3.0.txt
+    |-- THIRD_PARTY_NOTICES.md
+    +-- Steinberg-ASIO-SDK-LICENSE.txt
 ```
 
-Tagged releases publish the WPF application as an untrimmed, self-contained
-`win-x64` folder and copy the Release CLI into the same directory as the GUI.
-The combined binary ZIP therefore supports both double-click desktop use and
-standalone CLI use without a preinstalled .NET or Visual C++ runtime. The exact
-tagged source ZIP and SHA-256 manifest are published beside it. Vendor ASIO
-drivers are not redistributed.
+Tagged releases publish the WPF application as one untrimmed, self-contained
+`win-x64` executable. The ZIP root contains only `CapturePanel.exe` plus `bin`,
+`docs`, and `licenses`, which hold the native worker, README, and legal files.
+The package therefore supports both double-click desktop use and standalone CLI
+use without a preinstalled .NET or Visual C++ runtime. The exact tagged source
+ZIP and SHA-256 manifest are published beside it. Vendor ASIO drivers are not
+redistributed.

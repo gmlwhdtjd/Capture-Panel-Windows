@@ -42,10 +42,11 @@ have an installer and does not require administrator access.
    may require administrator access.
 4. Run `CapturePanel.exe`.
 
-Keep the release folder together: the desktop app launches the adjacent
-`capture-panel.exe` as its isolated audio worker. Release packages are
-self-contained and do not require a separate .NET or Visual C++ runtime
-installation.
+Keep `CapturePanel.exe` and the `bin`, `docs`, and `licenses` folders together.
+The release root contains only the desktop executable. The app launches
+`bin\capture-panel.exe` as its isolated audio worker, while the other folders
+contain documentation and legal notices. Release packages are self-contained
+and do not require a separate .NET or Visual C++ runtime installation.
 
 Current builds are not code-signed, so Microsoft Defender SmartScreen may show
 a warning on first launch. Only continue if the ZIP came from this repository's
@@ -96,8 +97,8 @@ Open PowerShell in the extracted release folder. The CLI is the same
 `capture-panel.exe` used by the desktop application:
 
 ```powershell
-.\capture-panel.exe --version
-.\capture-panel.exe --help
+.\bin\capture-panel.exe --version
+.\bin\capture-panel.exe --help
 ```
 
 ### Inspect drivers and channels
@@ -105,8 +106,8 @@ Open PowerShell in the extracted release folder. The CLI is the same
 List registered ASIO drivers, then inspect a selected driver ID:
 
 ```powershell
-.\capture-panel.exe devices
-.\capture-panel.exe channels --driver 'asio:{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}'
+.\bin\capture-panel.exe devices
+.\bin\capture-panel.exe channels --driver 'asio:{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}'
 ```
 
 Driver IDs are stable registry identities reported by `devices`.
@@ -117,7 +118,7 @@ Driver IDs are stable registry identities reported by `devices`.
 WAV:
 
 ```powershell
-.\capture-panel.exe test `
+.\bin\capture-panel.exe test `
   --driver 'asio:{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}' `
   --play-channel 1 `
   --record-channel 1 `
@@ -127,7 +128,7 @@ WAV:
 ### Capture a WAV
 
 ```powershell
-.\capture-panel.exe run `
+.\bin\capture-panel.exe run `
   --input source.wav `
   --output captured.wav `
   --driver 'asio:{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}' `
@@ -142,7 +143,7 @@ comma-separated lists, ranges, or combinations: `1`, `1,2`, `1-4`, or
 
 By default, the output bit depth matches the source WAV. Use `--bit-depth 16`,
 `--bit-depth 24`, or `--bit-depth 32` to override it. Run
-`.\capture-panel.exe help <command>` for the complete option list.
+`.\bin\capture-panel.exe help <command>` for the complete option list.
 
 ## Audio compatibility
 
@@ -170,7 +171,7 @@ and the .NET 10 SDK selected by `global.json`.
 Main outputs:
 
 - Desktop app: `out\dotnet\CapturePanel.App\<Configuration>\net10.0-windows\win-x64\CapturePanel.exe`
-- Bundled worker: the adjacent `capture-panel.exe`
+- Bundled worker: the app output's `bin\capture-panel.exe`
 - Standalone CLI: `out\build\windows-x64\bin\<Configuration>\capture-panel.exe`
 
 For development without hardware, set `CAPTURE_PANEL_SHOW_FAKE=1` before
@@ -184,10 +185,11 @@ $env:CAPTURE_PANEL_SHOW_FAKE = '1'
 ## Release automation
 
 A pushed `vX.Y.Z` tag matching both application versions triggers the release
-workflow. It tests native and managed code, publishes a self-contained
-`win-x64` folder, places the worker beside the desktop app, and creates a ZIP
-with licenses, third-party notices, source archive, and SHA-256 checksums.
-Hardware vendor drivers are never redistributed.
+workflow. It tests native and managed code, publishes the WPF UI as a
+self-contained single executable, and separates the worker, documentation, and
+legal notices into `bin`, `docs`, and `licenses`. It also creates an exact
+source archive and SHA-256 checksums. Hardware vendor drivers are never
+redistributed.
 
 ## License
 

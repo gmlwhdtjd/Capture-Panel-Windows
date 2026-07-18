@@ -151,11 +151,12 @@ optional developer tool.
 ## CI and release
 
 Hosted CI builds Debug and Release native targets first, then the .NET 10 WPF
-application and managed tests. Release publishing creates a self-contained
-`win-x64` WPF folder, places the native worker beside the GUI executable, and
-packages both with licenses, documentation, and corresponding source. CI does
-not open an ASIO driver. Physical routing remains a manual or protected
-self-hosted gate because hosted runners have neither the vendor driver nor the
-device. Release packaging runs with read-only repository permission; only the
-final artifact-verification/release job receives `contents: write`, and it
-rechecks the tag target and packaged SHA-256 values before publishing.
+application and managed tests. Release publishing creates one self-contained
+`CapturePanel.exe`, then separates the native worker, packaged documentation,
+and legal notices into `bin`, `docs`, and `licenses`. CI asserts this exact ZIP
+root shape and smoke-starts the packaged UI with the Fake backend. It does not
+open an ASIO driver. Physical routing remains a manual or protected self-hosted
+gate because hosted runners have neither the vendor driver nor the device.
+Release packaging runs with read-only repository permission; only the final
+artifact-verification/release job receives `contents: write`, and it rechecks
+the tag target and packaged SHA-256 values before publishing.

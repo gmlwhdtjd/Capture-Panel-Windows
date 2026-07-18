@@ -974,8 +974,8 @@ int execute(
         output
             << "Capture Panel for Windows is licensed under GNU GPL version 3 only.\n"
             << "This program comes with ABSOLUTELY NO WARRANTY. You may redistribute\n"
-            << "and modify it under GPLv3. See LICENSE for the full terms and\n"
-            << "THIRD_PARTY_NOTICES.md for the Steinberg ASIO SDK notice.\n";
+            << "and modify it under GPLv3. Release bundles include the full terms in\n"
+            << "licenses/GPL-3.0.txt and notices in licenses/THIRD_PARTY_NOTICES.md.\n";
         return success_exit_code;
     case Command::devices:
         print_devices(command, dependencies, output);

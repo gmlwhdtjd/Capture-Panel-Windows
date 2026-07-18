@@ -65,9 +65,9 @@ $app = '.\out\dotnet\CapturePanel.App\Debug\net10.0-windows\win-x64\CapturePanel
 & $app
 ```
 
-`capture-panel.exe` must remain beside `CapturePanel.exe`; the WPF application
-starts one short-lived worker process for device discovery, setup tests, and
-captures. To expose `fake:loopback` during UI development:
+`bin\capture-panel.exe` must remain under the application directory; the WPF
+application starts one short-lived worker process for device discovery, setup
+tests, and captures. To expose `fake:loopback` during UI development:
 
 ```powershell
 $env:CAPTURE_PANEL_SHOW_FAKE = '1'
@@ -92,13 +92,17 @@ unset so the Shell owns scaling.
 
 ## Publish layout
 
-The release workflow performs a self-contained, untrimmed `win-x64` WPF folder
-publish. The binary ZIP has `CapturePanel.exe` and `capture-panel.exe` in the
-same directory, followed by the .NET runtime files, `LICENSE`,
-`THIRD_PARTY_NOTICES.md`, and the required Steinberg and .NET runtime licenses
-and notices. Developer documentation remains in the separately published exact
-tagged source ZIP. `SHA256SUMS` is a separate release asset. Hardware vendor
-drivers are never copied into build or publish output.
+The release workflow performs an untrimmed, self-contained, single-file
+`win-x64` WPF publish. The binary ZIP root contains only `CapturePanel.exe` plus
+the `bin`, `docs`, and `licenses` directories. The native worker lives in
+`bin`, the packaged README in `docs`, and all GPL, third-party, Steinberg, and
+.NET runtime notices in `licenses`. Developer documentation remains in the
+separately published exact tagged source ZIP. `SHA256SUMS` is a separate release
+asset. Hardware vendor drivers are never copied into build or publish output.
+Native .NET/WPF libraries may be extracted to the user's temporary directory
+when the single-file app runs; they are not installed or registered
+system-wide. `tools\prepare-bundled-readme.ps1` creates the packaged README so
+its legal links resolve from `docs` into `licenses` in every build layout.
 
 ## Development rules
 
@@ -108,7 +112,7 @@ drivers are never copied into build or publish output.
 - Keep arbitrary-duration capture paths chunked; whole-file `AudioBuffer`
   materialization is reserved for bounded test and setup-verification fixtures.
 - Keep the WPF/native boundary on the versioned JSON Lines worker protocol.
-- Keep `capture-panel.exe` adjacent to `CapturePanel.exe` in build and publish output.
+- Keep the native worker at `bin\capture-panel.exe` in app and publish output.
 - Do not allocate, lock, log, perform file I/O, or call managed code from an ASIO callback.
 - Add or port a test before changing alignment and verification constants.
 - Public channel numbers are one-based; backend indices are zero-based.

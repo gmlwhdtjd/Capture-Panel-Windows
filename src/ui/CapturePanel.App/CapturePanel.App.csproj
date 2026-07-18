@@ -15,18 +15,26 @@
     <OutputPath>$(MSBuildThisFileDirectory)..\..\..\out\dotnet\CapturePanel.App\$(Configuration)\</OutputPath>
     <IntermediateOutputPath>$(MSBuildThisFileDirectory)..\..\..\out\dotnet-obj\CapturePanel.App\$(Configuration)\</IntermediateOutputPath>
     <CapturePanelCliPath Condition="'$(CapturePanelCliPath)' == ''">$(MSBuildThisFileDirectory)..\..\..\out\build\windows-x64\bin\$(Configuration)\capture-panel.exe</CapturePanelCliPath>
+    <BundledReadmePath>$(IntermediateOutputPath)bundled\README.md</BundledReadmePath>
+    <BundledReadmeScript>$(MSBuildThisFileDirectory)..\..\..\tools\prepare-bundled-readme.ps1</BundledReadmeScript>
   </PropertyGroup>
 
   <ItemGroup>
     <Resource Include="$(MSBuildThisFileDirectory)..\..\..\assets\windows\CapturePanel.png"
               Link="Assets\CapturePanel.png" />
-    <None Include="$(CapturePanelCliPath)" Link="capture-panel.exe" CopyToOutputDirectory="PreserveNewest" Condition="Exists('$(CapturePanelCliPath)')" />
-    <None Include="$(MSBuildThisFileDirectory)..\..\..\LICENSE" Link="LICENSE" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="$(MSBuildThisFileDirectory)..\..\..\THIRD_PARTY_NOTICES.md" Link="THIRD_PARTY_NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
-    <None Include="$(MSBuildThisFileDirectory)..\..\..\third_party\asio\LICENSE.txt" Link="licenses\Steinberg-ASIO-SDK-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="$(CapturePanelCliPath)" Link="bin\capture-panel.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" Condition="Exists('$(CapturePanelCliPath)')" />
+    <None Include="$(BundledReadmePath)" Link="docs\README.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\..\LICENSE" Link="licenses\GPL-3.0.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\..\THIRD_PARTY_NOTICES.md" Link="licenses\THIRD_PARTY_NOTICES.md" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
+    <None Include="$(MSBuildThisFileDirectory)..\..\..\third_party\asio\LICENSE.txt" Link="licenses\Steinberg-ASIO-SDK-LICENSE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" ExcludeFromSingleFile="true" />
   </ItemGroup>
 
   <Target Name="RequireNativeWorker" BeforeTargets="Build">
     <Error Condition="!Exists('$(CapturePanelCliPath)')" Text="Native worker not found at $(CapturePanelCliPath). Build the C++ targets first." />
+  </Target>
+
+  <Target Name="PrepareBundledReadme" BeforeTargets="PrepareForBuild;ComputeFilesToPublish">
+    <Error Condition="!Exists('$(BundledReadmeScript)')" Text="Bundled README script not found at $(BundledReadmeScript)." />
+    <Exec Command="powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;$(BundledReadmeScript)&quot; -SourcePath &quot;$(MSBuildThisFileDirectory)..\..\..\README.md&quot; -DestinationPath &quot;$(BundledReadmePath)&quot;" />
   </Target>
 </Project>

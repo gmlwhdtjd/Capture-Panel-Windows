@@ -1,4 +1,3 @@
-using System.IO;
 using System.Windows;
 using CapturePanel.App.Services;
 using CapturePanel.App.ViewModels;
@@ -11,8 +10,7 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
-        var workerPath = Path.Combine(AppContext.BaseDirectory, "capture-panel.exe");
-        var worker = new CaptureWorkerClient(workerPath);
+        var worker = new CaptureWorkerClient(AppBundlePaths.WorkerPath);
         var model = new MainViewModel(
             worker,
             new JsonAppSettingsStore(),

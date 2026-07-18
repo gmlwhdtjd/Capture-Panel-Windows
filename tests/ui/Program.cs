@@ -48,6 +48,7 @@ internal static class Program
             ("JSON settings persist the Windows route", JsonSettingsRoundTrip),
             ("WAV metadata reader reports source format and frames", WavMetadataRoundTrip),
             ("WAV metadata reader rejects malformed native-incompatible files", WavMetadataRejectsMalformedFiles),
+            ("bundle layout separates binaries documents and licenses", BundleLayoutSeparatesSupportFiles),
             ("native JSON worker contract supports Fake test and capture", NativeWorkerJsonContract),
             ("native worker client serializes and bounds cancellation", WorkerClientSerializesAndCancels),
             ("Windows Fluent views load and lay out off-screen", WindowsFluentViewsLoad),
@@ -786,11 +787,40 @@ internal static class Program
         return Task.CompletedTask;
     }
 
+    private static Task BundleLayoutSeparatesSupportFiles()
+    {
+        var expectedBin = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "bin"));
+        var expectedDocs = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "docs"));
+        var expectedLicenses = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "licenses"));
+        Equal(expectedBin, Path.GetFullPath(AppBundlePaths.BinDirectory));
+        Equal(expectedDocs, Path.GetFullPath(AppBundlePaths.DocsDirectory));
+        Equal(expectedLicenses, Path.GetFullPath(AppBundlePaths.LicensesDirectory));
+        Equal(
+            Path.Combine(expectedBin, "capture-panel.exe"),
+            Path.GetFullPath(AppBundlePaths.WorkerPath));
+        Require(File.Exists(AppBundlePaths.WorkerPath), "The native worker was not copied under bin.");
+        var readmePath = AppBundlePaths.DocumentPath("README.md");
+        Require(File.Exists(readmePath), "The bundled README is missing.");
+        var readme = File.ReadAllText(readmePath);
+        Require(
+            readme.Contains("../licenses/GPL-3.0.txt", StringComparison.Ordinal),
+            "The bundled README does not link to the bundled GPL license.");
+        Require(
+            readme.Contains("../licenses/THIRD_PARTY_NOTICES.md", StringComparison.Ordinal),
+            "The bundled README does not link to the bundled third-party notices.");
+
+        var settings = new SettingsViewModel(AppBundlePaths.WorkerPath);
+        Require(settings.LicenseAvailable, "The bundled GPL license is missing.");
+        Require(settings.ThirdPartyNoticesAvailable, "The bundled third-party notices are missing.");
+        Require(settings.AsioLicenseAvailable, "The bundled ASIO SDK license is missing.");
+        return Task.CompletedTask;
+    }
+
     private static async Task NativeWorkerJsonContract()
     {
         using var fixture = new Fixture();
-        var worker = new CaptureWorkerClient(Path.Combine(AppContext.BaseDirectory, "capture-panel.exe"));
-        Require(worker.WorkerAvailable, "The native worker was not copied beside the managed tests.");
+        var worker = new CaptureWorkerClient(AppBundlePaths.WorkerPath);
+        Require(worker.WorkerAvailable, "The native worker was not copied under bin.");
 
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
         var channels = await worker.GetChannelsAsync("fake:loopback", timeout.Token);
