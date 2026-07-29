@@ -15,6 +15,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly ICaptureWorkerClient _worker;
     private readonly IAppSettingsStore _settingsStore;
     private readonly IFileDialogService _fileDialogs;
+    private readonly ICaptureNotificationService _notificationService;
     private readonly bool _showDevelopmentDevices;
     private readonly TimeSpan _setupTestTimeout;
     private AppSettings _settings;
@@ -57,11 +58,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         IAppSettingsStore settingsStore,
         IFileDialogService fileDialogs,
         bool showDevelopmentDevices = false,
-        TimeSpan? setupTestTimeout = null)
+        TimeSpan? setupTestTimeout = null,
+        ICaptureNotificationService? notificationService = null)
     {
         _worker = worker;
         _settingsStore = settingsStore;
         _fileDialogs = fileDialogs;
+        _notificationService = notificationService ?? DisabledCaptureNotificationService.Instance;
         _showDevelopmentDevices = showDevelopmentDevices;
         _setupTestTimeout = setupTestTimeout ?? TimeSpan.FromSeconds(30);
         if (_setupTestTimeout <= TimeSpan.Zero)
@@ -847,25 +850,40 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
+        var sourceFilename = Path.GetFileName(SourcePath);
         var defaultName = $"{Path.GetFileNameWithoutExtension(SourcePath)}-captured.wav";
-        var destinationPath = _fileDialogs.ChooseCaptureDestination(defaultName);
-        if (destinationPath is null)
+        string fullDestination;
+        string temporaryPath;
+        try
         {
+            var destinationPath = _fileDialogs.ChooseCaptureDestination(defaultName);
+            if (destinationPath is null)
+            {
+                return;
+            }
+
+            fullDestination = Path.GetFullPath(destinationPath);
+            var directory = Path.GetDirectoryName(fullDestination)
+                ?? throw new InvalidOperationException(
+                    "The capture destination has no parent directory.");
+            temporaryPath = Path.Combine(
+                directory,
+                $".capture-panel-{Guid.NewGuid():N}.tmp.wav");
+        }
+        catch (Exception exception)
+        {
+            ReportCapturePreparationFailure(sourceFilename, exception);
             return;
         }
-
-        var fullDestination = Path.GetFullPath(destinationPath);
-        var directory = Path.GetDirectoryName(fullDestination)
-            ?? throw new InvalidOperationException("The capture destination has no parent directory.");
-        var temporaryPath = Path.Combine(
-            directory,
-            $".capture-panel-{Guid.NewGuid():N}.tmp.wav");
 
         var operationCancellation = new CancellationTokenSource();
         _operationCancellation = operationCancellation;
         var operationToken = operationCancellation.Token;
         var validatedOutput = false;
         var promotedOutput = false;
+        var notifyCaptureFailure = true;
+        var captureFailureReason = "The capture could not be completed.";
+        PrepareCaptureNotification();
         IsCapturing = true;
         IsCancelling = false;
         CaptureWarningMessage = null;
@@ -879,12 +897,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             var sourceSnapshot = await RevalidateSourceAsync(operationToken);
             if (sourceSnapshot is null)
             {
+                captureFailureReason = Assessment;
                 return;
             }
             if (WavMetadataReader.RefersToSameFile(sourceSnapshot, fullDestination))
             {
                 ProgressLabel = "Failed";
-                var sameFileMessage = "Capture failed: The destination must not overwrite the source WAV.";
+                captureFailureReason = "The destination must not overwrite the source WAV.";
+                var sameFileMessage = $"Capture failed: {captureFailureReason}";
                 Assessment = sameFileMessage;
                 RaiseError(sameFileMessage);
                 return;
@@ -912,6 +932,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             ValidateCaptureCompleted(completed, temporaryPath, sourceSnapshot.Metadata);
             if (await ReadSourceIfUnchangedAsync(sourceSnapshot, operationToken) is null)
             {
+                captureFailureReason = Assessment;
                 return;
             }
             validatedOutput = true;
@@ -924,9 +945,12 @@ public sealed class MainViewModel : ObservableObject, IDisposable
                 : $"Saved {Path.GetFileName(fullDestination)} with warning: {completed.Warnings[0].Message}";
             ProgressLabel = "Saved";
             Assessment = "Capture saved.";
+            notifyCaptureFailure = false;
+            NotifyCaptureSaved(Path.GetFileName(fullDestination));
         }
         catch (OperationCanceledException)
         {
+            notifyCaptureFailure = false;
             ProgressLabel = "Cancelled";
             Assessment = "Capture cancelled.";
         }
@@ -935,11 +959,13 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             // A worker teardown can report its own I/O or driver error after cancellation wins
             // the race. Until an output has been validated, the user's cancellation is the
             // authoritative outcome and must not invalidate the previously verified route.
+            notifyCaptureFailure = false;
             ProgressLabel = "Cancelled";
             Assessment = "Capture cancelled.";
         }
         catch (Exception exception)
         {
+            captureFailureReason = exception.Message;
             ProgressLabel = "Failed";
             var recovery = validatedOutput && File.Exists(temporaryPath)
                 ? temporaryPath
@@ -972,6 +998,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             {
                 _operationCancellation = null;
             }
+            if (notifyCaptureFailure)
+            {
+                NotifyCaptureFailed(sourceFilename, captureFailureReason);
+            }
             IsCapturing = false;
             IsCancelling = false;
             ProgressFraction = null;
@@ -991,6 +1021,57 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         ProgressLabel = "Cancelling...";
         RemainingSeconds = null;
         _operationCancellation?.Cancel();
+    }
+
+    private void PrepareCaptureNotification()
+    {
+        try
+        {
+            _notificationService.PrepareForCapture();
+        }
+        catch (Exception)
+        {
+            // Notifications are supplementary and must never block a capture.
+        }
+    }
+
+    private void NotifyCaptureSaved(string filename)
+    {
+        try
+        {
+            _notificationService.NotifyCaptureSaved(filename);
+        }
+        catch (Exception)
+        {
+            // The capture has already been promoted; notification failure is non-fatal.
+        }
+    }
+
+    private void NotifyCaptureFailed(string filename, string reason)
+    {
+        try
+        {
+            _notificationService.NotifyCaptureFailed(filename, reason);
+        }
+        catch (Exception)
+        {
+            // Notification failure must not replace the original capture failure.
+        }
+    }
+
+    private void ReportCapturePreparationFailure(string filename, Exception exception)
+    {
+        var reason = string.IsNullOrWhiteSpace(exception.Message)
+            ? "Could not prepare the capture destination."
+            : exception.Message;
+        CaptureWarningMessage = null;
+        RecoveryOutputPath = null;
+        ProgressLabel = "Failed";
+        Assessment = $"Capture failed: {reason}";
+        PrepareCaptureNotification();
+        NotifyCaptureFailed(filename, reason);
+        RaiseError(Assessment);
+        NotifyStateChanged();
     }
 
     private void BeginSetupTest()

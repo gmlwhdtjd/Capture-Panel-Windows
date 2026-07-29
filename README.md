@@ -24,6 +24,7 @@ Key features:
 - Test input level, latency, clipping, and alignment stability before capture.
 - Apply playback and recording trim.
 - Save a WAV aligned to the beginning and duration of the source.
+- Show a local notification when a capture succeeds or fails.
 - Contain vendor ASIO drivers in a short-lived worker process outside the UI.
 - Cancel safely and avoid promoting partial captures to the final output path.
 

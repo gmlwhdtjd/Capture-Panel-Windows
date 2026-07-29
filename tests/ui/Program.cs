@@ -1,5 +1,6 @@
 using System.IO;
 using System.ComponentModel;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Windows;
@@ -32,9 +33,13 @@ internal static class Program
             ("changed or missing source files fail closed", SourceChangesFailClosed),
             ("source changes during Test or Capture discard stale results", SourceChangesDuringWorkerAreRejected),
             ("capture cannot overwrite its source WAV", CaptureCannotOverwriteSource),
+            ("cancelled save dialog does not prepare a notification", CancelledSaveDialogDoesNotPrepareNotification),
+            ("destination preparation failures send a notification", DestinationPreparationFailuresNotify),
             ("inconsistent setup-test results are rejected", InconsistentSetupResultIsRejected),
             ("capture uses a temporary output and promotes it on success", CapturePromotesTemporaryOutput),
             ("capture warnings remain visible after a successful save", CaptureWarningsRemainVisible),
+            ("notification errors cannot turn a saved capture into a failure", NotificationErrorsAreNonFatal),
+            ("failure notification errors preserve the original failure", FailureNotificationErrorsAreNonFatal),
             ("invalid capture results are never promoted", InvalidCaptureResultsAreRejected),
             ("late worker completion cannot win a capture cancellation", LateCaptureCompletionStaysCancelled),
             ("capture cancellation wins a concurrent worker error", CaptureCancellationWinsConcurrentWorkerError),
@@ -51,6 +56,9 @@ internal static class Program
             ("bundle layout separates binaries documents and licenses", BundleLayoutSeparatesSupportFiles),
             ("native JSON worker contract supports Fake test and capture", NativeWorkerJsonContract),
             ("native worker client serializes and bounds cancellation", WorkerClientSerializesAndCancels),
+            ("Windows Shell notification ABI is available", WindowsShellNotificationAbiIsAvailable),
+            ("Windows Shell notification callbacks are isolated by icon ID", WindowsShellNotificationCallbacksAreIsolated),
+            ("Windows Shell notification content preserves the outcome", WindowsShellNotificationContentPreservesOutcome),
             ("Windows Fluent views load and lay out off-screen", WindowsFluentViewsLoad),
         };
 
@@ -303,6 +311,13 @@ internal static class Program
                 "The missing-source reason should remain visible.");
             Equal(StatusKind.Error, model.StatusKind);
             Equal(model.Assessment, model.StatusMessage);
+            Equal(1, fixture.Notifications.FailedCaptures.Count);
+            Equal("source.wav", fixture.Notifications.FailedCaptures[0].Filename);
+            Require(
+                fixture.Notifications.FailedCaptures[0].Reason.Contains(
+                    "no longer available",
+                    StringComparison.Ordinal),
+                "A missing source should provide the failure reason to the notification.");
         }
     }
 
@@ -351,6 +366,12 @@ internal static class Program
                 "The post-Capture source change should remain visible.");
             Require(!Directory.EnumerateFiles(fixture.DirectoryPath, ".capture-panel-*.tmp.wav").Any(),
                 "A discarded stale capture should remove its temporary output.");
+            Equal(1, fixture.Notifications.FailedCaptures.Count);
+            Require(
+                fixture.Notifications.FailedCaptures[0].Reason.Contains(
+                    "changed on disk",
+                    StringComparison.Ordinal),
+                "A changed source should produce a capture failure notification.");
         }
     }
 
@@ -366,11 +387,13 @@ internal static class Program
     {
         using var fixture = new Fixture();
         var dialogs = new FakeFileDialogService(fixture.SourcePath, fixture.SourcePath);
+        var notifications = new RecordingCaptureNotificationService();
         using var model = new MainViewModel(
             fixture.Worker,
             fixture.Settings,
             dialogs,
-            showDevelopmentDevices: true);
+            showDevelopmentDevices: true,
+            notificationService: notifications);
         await model.InitializeAsync();
         model.ChooseSourceCommand.Execute(null);
         model.TestCommand.Execute(null);
@@ -385,6 +408,10 @@ internal static class Program
         Equal(480L, WavMetadataReader.Read(fixture.SourcePath).Frames);
         Require(model.CanCapture, "A rejected destination should preserve the verified audio route.");
         Equal(StatusKind.Error, model.StatusKind);
+        Equal(1, notifications.FailedCaptures.Count);
+        Equal(
+            "The destination must not overwrite the source WAV.",
+            notifications.FailedCaptures[0].Reason);
 
         using var hardLinkFixture = new Fixture();
         var hardLinkPath = Path.Combine(hardLinkFixture.DirectoryPath, "source-hard-link.wav");
@@ -405,6 +432,70 @@ internal static class Program
         hardLinkModel.CaptureCommand.Execute(null);
         await WaitUntil(() => hardLinkModel.Assessment.Contains("must not overwrite", StringComparison.Ordinal));
         Equal(0, hardLinkFixture.Worker.CaptureCalls);
+    }
+
+    private static async Task CancelledSaveDialogDoesNotPrepareNotification()
+    {
+        using var fixture = new Fixture();
+        var notifications = new RecordingCaptureNotificationService();
+        using var model = new MainViewModel(
+            fixture.Worker,
+            fixture.Settings,
+            new FakeFileDialogService(fixture.SourcePath, destinationPath: null),
+            showDevelopmentDevices: true,
+            notificationService: notifications);
+        await model.InitializeAsync();
+        model.ChooseSourceCommand.Execute(null);
+        model.TestCommand.Execute(null);
+        await WaitUntil(() => model.CanCapture);
+
+        model.CaptureCommand.Execute(null);
+
+        Equal(0, fixture.Worker.CaptureCalls);
+        Equal(0, notifications.PrepareCalls);
+        Equal(0, notifications.NotifyCalls);
+    }
+
+    private static async Task DestinationPreparationFailuresNotify()
+    {
+        var dialogFactories = new Func<string, IFileDialogService>[]
+        {
+            sourcePath => new ThrowingFileDialogService(
+                sourcePath,
+                new IOException("The save dialog could not be opened.")),
+            sourcePath => new FakeFileDialogService(
+                sourcePath,
+                "invalid\0destination.wav"),
+        };
+
+        foreach (var createDialogs in dialogFactories)
+        {
+            using var fixture = new Fixture();
+            var notifications = new RecordingCaptureNotificationService();
+            using var model = new MainViewModel(
+                fixture.Worker,
+                fixture.Settings,
+                createDialogs(fixture.SourcePath),
+                showDevelopmentDevices: true,
+                notificationService: notifications);
+            await model.InitializeAsync();
+            model.ChooseSourceCommand.Execute(null);
+            model.TestCommand.Execute(null);
+            await WaitUntil(() => model.CanCapture);
+
+            model.CaptureCommand.Execute(null);
+
+            Equal(0, fixture.Worker.CaptureCalls);
+            Require(model.CanCapture,
+                "A destination error must preserve the verified audio route.");
+            Require(model.Assessment.StartsWith("Capture failed:", StringComparison.Ordinal),
+                "A destination error should remain visible.");
+            Equal(1, notifications.PrepareCalls);
+            Equal(1, notifications.FailedCaptures.Count);
+            Equal("source.wav", notifications.FailedCaptures[0].Filename);
+            Require(!string.IsNullOrWhiteSpace(notifications.FailedCaptures[0].Reason),
+                "A destination failure notification must include a reason.");
+        }
     }
 
     private static async Task InconsistentSetupResultIsRejected()
@@ -459,6 +550,10 @@ internal static class Program
         Equal("Capture saved.", model.Assessment);
         Equal("Saved source-captured.wav.", model.StatusMessage);
         Require(model.CanCapture, "A successful capture should preserve the verified setup.");
+        Equal(1, fixture.Notifications.PrepareCalls);
+        Equal(1, fixture.Notifications.SavedFilenames.Count);
+        Equal("source-captured.wav", fixture.Notifications.SavedFilenames[0]);
+        Equal(0, fixture.Notifications.FailedCaptures.Count);
     }
 
     private static async Task CaptureWarningsRemainVisible()
@@ -484,6 +579,52 @@ internal static class Program
         Require(model.StatusMessage.Contains("digital full scale", StringComparison.Ordinal),
             "A successful capture warning must remain visible in the status card.");
         Require(model.CanCapture, "A capture warning should not invalidate a verified route.");
+    }
+
+    private static async Task NotificationErrorsAreNonFatal()
+    {
+        using var fixture = new Fixture();
+        fixture.Notifications.ThrowOnPrepare = true;
+        fixture.Notifications.ThrowOnNotify = true;
+        using var model = fixture.CreateModel();
+        await model.InitializeAsync();
+        model.ChooseSourceCommand.Execute(null);
+        model.TestCommand.Execute(null);
+        await WaitUntil(() => model.CanCapture);
+
+        model.CaptureCommand.Execute(null);
+        await WaitUntil(() => fixture.Worker.CaptureCalls == 1 && !model.IsCapturing);
+
+        Require(File.Exists(fixture.DestinationPath),
+            "A notification error must not discard an already saved capture.");
+        Equal("Capture saved.", model.Assessment);
+        Equal("Saved source-captured.wav.", model.StatusMessage);
+        Require(model.CanCapture,
+            "A notification error must preserve the verified capture route.");
+        Equal(1, fixture.Notifications.PrepareCalls);
+        Equal(1, fixture.Notifications.NotifyCalls);
+    }
+
+    private static async Task FailureNotificationErrorsAreNonFatal()
+    {
+        using var fixture = new Fixture();
+        fixture.Worker.CaptureException = new IOException("The ASIO device was disconnected.");
+        fixture.Notifications.ThrowOnNotify = true;
+        using var model = fixture.CreateModel();
+        await model.InitializeAsync();
+        model.ChooseSourceCommand.Execute(null);
+        model.TestCommand.Execute(null);
+        await WaitUntil(() => model.CanCapture);
+
+        model.CaptureCommand.Execute(null);
+        await WaitUntil(() => fixture.Worker.CaptureCalls == 1 && !model.IsCapturing);
+
+        Require(!model.CanCapture,
+            "A notification error must not restore a failed capture route.");
+        Equal(CaptureStabilityLevel.Failed, model.StabilityLevel);
+        Require(model.Assessment.Contains("disconnected", StringComparison.Ordinal),
+            "The original capture failure must remain visible.");
+        Equal(1, fixture.Notifications.NotifyCalls);
     }
 
     private static async Task InvalidCaptureResultsAreRejected()
@@ -526,6 +667,12 @@ internal static class Program
                 "Invalid output should produce a visible capture failure.");
             Require(!Directory.EnumerateFiles(fixture.DirectoryPath, ".capture-panel-*.tmp.wav").Any(),
                 "Invalid temporary output should be removed.");
+            Equal(1, fixture.Notifications.PrepareCalls);
+            Equal(1, fixture.Notifications.NotifyCalls);
+            Equal(1, fixture.Notifications.FailedCaptures.Count);
+            Equal("source.wav", fixture.Notifications.FailedCaptures[0].Filename);
+            Require(!string.IsNullOrWhiteSpace(fixture.Notifications.FailedCaptures[0].Reason),
+                "An invalid worker result should include a failure reason.");
         }
     }
 
@@ -557,6 +704,8 @@ internal static class Program
         Require(model.ProgressFraction is null,
             "Queued progress from a cancelled worker must not revive the progress bar.");
         Require(model.CanCapture, "Cancellation should preserve the previously verified route.");
+        Equal(1, fixture.Notifications.PrepareCalls);
+        Equal(0, fixture.Notifications.NotifyCalls);
     }
 
     private static async Task CaptureFailureInvalidatesSetup()
@@ -577,6 +726,13 @@ internal static class Program
         Require(model.StatusMessage.Contains("disconnected", StringComparison.Ordinal),
             "The capture failure should remain visible in the status region.");
         Equal(model.StatusMessage, model.VerificationFooterText);
+        Equal(1, fixture.Notifications.PrepareCalls);
+        Equal(1, fixture.Notifications.NotifyCalls);
+        Equal(1, fixture.Notifications.FailedCaptures.Count);
+        Equal("source.wav", fixture.Notifications.FailedCaptures[0].Filename);
+        Equal(
+            "The ASIO device was disconnected.",
+            fixture.Notifications.FailedCaptures[0].Reason);
     }
 
     private static async Task CaptureCancellationWinsConcurrentWorkerError()
@@ -603,6 +759,7 @@ internal static class Program
             "A cancellation/error race must not promote an output file.");
         Require(model.RecoveryOutputPath is null,
             "An unvalidated cancellation/error race must not expose a recovery output.");
+        Equal(0, fixture.Notifications.NotifyCalls);
     }
 
     private static async Task StaleChannelDiscoveryIsIgnored()
@@ -926,6 +1083,107 @@ internal static class Program
         }
     }
 
+    private static Task WindowsShellNotificationAbiIsAvailable()
+    {
+        var dataType = typeof(WindowsCaptureNotificationService).GetNestedType(
+            "NotifyIconData",
+            BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("The Shell notification data type is missing.");
+        Equal(976, Marshal.SizeOf(dataType));
+
+        Require(NativeLibrary.TryLoad("shell32.dll", out var shell),
+            "Windows Shell could not be loaded.");
+        try
+        {
+            Require(NativeLibrary.TryGetExport(shell, "Shell_NotifyIconW", out _),
+                "Shell_NotifyIconW is unavailable.");
+            Require(NativeLibrary.TryGetExport(shell, "ExtractIconExW", out _),
+                "ExtractIconExW is unavailable.");
+        }
+        finally
+        {
+            NativeLibrary.Free(shell);
+        }
+
+        return Task.CompletedTask;
+    }
+
+    private static Task WindowsShellNotificationCallbacksAreIsolated()
+    {
+        using var service = new WindowsCaptureNotificationService(
+            System.Windows.Threading.Dispatcher.CurrentDispatcher);
+        var serviceType = typeof(WindowsCaptureNotificationService);
+        var iconIdField = serviceType.GetField(
+            "_notificationIconId",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("The notification icon ID field is missing.");
+        var decodeMethod = serviceType.GetMethod(
+            "TryDecodeCurrentNotificationCallback",
+            BindingFlags.Instance | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("The notification callback decoder is missing.");
+        iconIdField.SetValue(service, (ushort)2);
+
+        object?[] staleVersion4Arguments =
+        [
+            IntPtr.Zero,
+            new IntPtr((1 << 16) | 0x0403),
+            0u,
+        ];
+        Require(!(bool)decodeMethod.Invoke(service, staleVersion4Arguments)!,
+            "A delayed callback from an old icon must not close the current notification.");
+
+        object?[] currentVersion4Arguments =
+        [
+            IntPtr.Zero,
+            new IntPtr((2 << 16) | 0x0403),
+            0u,
+        ];
+        Require((bool)decodeMethod.Invoke(service, currentVersion4Arguments)!,
+            "The current version-4 Shell callback was not recognized.");
+        Equal(0x0403u, (uint)currentVersion4Arguments[2]!);
+
+        object?[] currentLegacyArguments =
+        [
+            new IntPtr(2),
+            new IntPtr(0x0404),
+            0u,
+        ];
+        Require((bool)decodeMethod.Invoke(service, currentLegacyArguments)!,
+            "The current legacy Shell callback was not recognized.");
+        Equal(0x0404u, (uint)currentLegacyArguments[2]!);
+
+        return Task.CompletedTask;
+    }
+
+    private static Task WindowsShellNotificationContentPreservesOutcome()
+    {
+        var serviceType = typeof(WindowsCaptureNotificationService);
+        var savedInfoMethod = serviceType.GetMethod(
+            "BuildCaptureSavedInfo",
+            BindingFlags.Static | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("The saved-notification formatter is missing.");
+        var failedInfoMethod = serviceType.GetMethod(
+            "BuildCaptureFailedInfo",
+            BindingFlags.Static | BindingFlags.NonPublic)
+            ?? throw new InvalidOperationException("The failed-notification formatter is missing.");
+
+        var longFilename = new string('x', 255);
+        var savedInfo = (string)savedInfoMethod.Invoke(null, [longFilename])!;
+        Require(savedInfo.Length <= 255,
+            "Saved notification content exceeds the Shell limit.");
+        Require(savedInfo.EndsWith(" was saved successfully.", StringComparison.Ordinal),
+            "A long filename must not remove the saved outcome.");
+
+        const string reason = "The ASIO device was disconnected.";
+        var failedInfo = (string)failedInfoMethod.Invoke(null, [longFilename, reason])!;
+        Require(failedInfo.Length <= 255,
+            "Failed notification content exceeds the Shell limit.");
+        Require(failedInfo.Contains(reason, StringComparison.Ordinal),
+            "A long filename must not remove the capture failure reason.");
+
+        return Task.CompletedTask;
+    }
+
     private static Task WindowsFluentViewsLoad()
         => RunOnSta(() =>
         {
@@ -1173,6 +1431,7 @@ internal sealed class Fixture : IDisposable
         Worker = new FakeWorkerClient();
         Dialogs = new FakeFileDialogService(SourcePath, DestinationPath);
         Settings = new MemorySettingsStore();
+        Notifications = new RecordingCaptureNotificationService();
     }
 
     public string DirectoryPath { get; }
@@ -1181,9 +1440,15 @@ internal sealed class Fixture : IDisposable
     public FakeWorkerClient Worker { get; }
     public FakeFileDialogService Dialogs { get; }
     public MemorySettingsStore Settings { get; }
+    public RecordingCaptureNotificationService Notifications { get; }
 
     public MainViewModel CreateModel()
-        => new(Worker, Settings, Dialogs, showDevelopmentDevices: true);
+        => new(
+            Worker,
+            Settings,
+            Dialogs,
+            notificationService: Notifications,
+            showDevelopmentDevices: true);
 
     public void Dispose()
     {
@@ -1257,6 +1522,45 @@ internal sealed class Fixture : IDisposable
         writer.Write(3);
         writer.Write(new byte[3]);
         writer.Write((byte)0);
+    }
+}
+
+internal sealed class RecordingCaptureNotificationService : ICaptureNotificationService
+{
+    public int PrepareCalls { get; private set; }
+    public int NotifyCalls { get; private set; }
+    public List<string> SavedFilenames { get; } = [];
+    public List<(string Filename, string Reason)> FailedCaptures { get; } = [];
+    public bool ThrowOnPrepare { get; set; }
+    public bool ThrowOnNotify { get; set; }
+
+    public void PrepareForCapture()
+    {
+        PrepareCalls++;
+        if (ThrowOnPrepare)
+        {
+            throw new InvalidOperationException("Synthetic notification preparation failure.");
+        }
+    }
+
+    public void NotifyCaptureSaved(string filename)
+    {
+        NotifyCalls++;
+        if (ThrowOnNotify)
+        {
+            throw new InvalidOperationException("Synthetic notification delivery failure.");
+        }
+        SavedFilenames.Add(filename);
+    }
+
+    public void NotifyCaptureFailed(string filename, string reason)
+    {
+        NotifyCalls++;
+        if (ThrowOnNotify)
+        {
+            throw new InvalidOperationException("Synthetic notification delivery failure.");
+        }
+        FailedCaptures.Add((filename, reason));
     }
 }
 
@@ -1504,10 +1808,20 @@ internal sealed class HangingDiscoveryWorkerClient : ICaptureWorkerClient
         => throw new NotSupportedException();
 }
 
-internal sealed class FakeFileDialogService(string sourcePath, string destinationPath) : IFileDialogService
+internal sealed class FakeFileDialogService(string sourcePath, string? destinationPath) : IFileDialogService
 {
     public string? ChooseSourceWav() => sourcePath;
     public string? ChooseCaptureDestination(string defaultFilename) => destinationPath;
+}
+
+internal sealed class ThrowingFileDialogService(
+    string sourcePath,
+    Exception destinationException) : IFileDialogService
+{
+    public string? ChooseSourceWav() => sourcePath;
+
+    public string? ChooseCaptureDestination(string defaultFilename)
+        => throw destinationException;
 }
 
 internal sealed class MemorySettingsStore : IAppSettingsStore
