@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 4.2)
 
 project(
     CapturePanelWindows
-    VERSION 0.2.1
+    VERSION 0.2.2
     DESCRIPTION "Capture Panel core and command-line application for Windows"
     LANGUAGES CXX
 )

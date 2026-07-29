@@ -20,7 +20,7 @@
 #include <utility>
 
 #ifndef CAPTURE_PANEL_VERSION
-#define CAPTURE_PANEL_VERSION "0.2.1"
+#define CAPTURE_PANEL_VERSION "0.2.2"
 #endif
 
 namespace capture_panel::cli {
