@@ -9,7 +9,7 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <AssemblyName>CapturePanel</AssemblyName>
     <RootNamespace>CapturePanel.App</RootNamespace>
-    <Version>0.2.2</Version>
+    <Version>0.2.3</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>$(MSBuildThisFileDirectory)..\..\..\assets\windows\CapturePanel.ico</ApplicationIcon>
     <OutputPath>$(MSBuildThisFileDirectory)..\..\..\out\dotnet\CapturePanel.App\$(Configuration)\</OutputPath>

@@ -823,7 +823,7 @@ CP_TEST_CASE("CLI help version license and usage errors do not require audio ser
     output.str("");
     output.clear();
     CP_REQUIRE(cli::run_cli({"version"}, no_dependencies, output, error) == 0);
-    CP_REQUIRE(output.str() == "capture-panel 0.2.2\n");
+    CP_REQUIRE(output.str() == "capture-panel 0.2.3\n");
 
     output.str("");
     output.clear();
