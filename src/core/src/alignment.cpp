@@ -20,12 +20,30 @@ namespace {
 
 using Frame = std::int64_t;
 
+inline constexpr Frame cancellation_poll_interval_frames = 4'096;
+
 struct FrameRange {
     Frame lower = 0;
     Frame upper = 0;
 
     [[nodiscard]] bool empty() const noexcept { return lower >= upper; }
 };
+
+void throw_if_cancelled(
+    const std::shared_ptr<CancellationToken>& cancellation) {
+    if (cancellation && cancellation->is_cancelled()) {
+        throw CaptureError(ErrorCode::capture_cancelled, "Capture was cancelled.");
+    }
+}
+
+void poll_cancellation(
+    const std::shared_ptr<CancellationToken>& cancellation,
+    const Frame frame,
+    const Frame first_frame) {
+    if ((frame - first_frame) % cancellation_poll_interval_frames == 0) {
+        throw_if_cancelled(cancellation);
+    }
+}
 
 [[nodiscard]] double mean(const std::vector<double>& values) {
     if (values.empty()) return 0.0;
@@ -375,9 +393,11 @@ void update_alignment_cell(
 [[nodiscard]] float peak_in_frame_range(
     const std::vector<float>& samples,
     std::uint32_t channel_count,
-    FrameRange frame_range) {
+    FrameRange frame_range,
+    const std::shared_ptr<CancellationToken>& cancellation) {
     float peak = 0.0F;
     for (auto frame = frame_range.lower; frame < frame_range.upper; ++frame) {
+        poll_cancellation(cancellation, frame, frame_range.lower);
         peak = std::max(peak, frame_peak(samples, channel_count, frame));
     }
     return peak;
@@ -386,16 +406,19 @@ void update_alignment_cell(
 [[nodiscard]] std::vector<MarkerCandidate> detect_marker_impulse_candidates(
     const std::vector<float>& samples,
     std::uint32_t channel_count,
-    FrameRange frame_range) {
+    FrameRange frame_range,
+    const std::shared_ptr<CancellationToken>& cancellation) {
     if (frame_range.empty()) return {};
 
-    const auto peak_level = peak_in_frame_range(samples, channel_count, frame_range);
+    const auto peak_level = peak_in_frame_range(
+        samples, channel_count, frame_range, cancellation);
     const auto adaptive_threshold = std::max(
         peak_level * constants::impulse::adaptive_threshold_ratio,
         constants::impulse::minimum_threshold);
     std::vector<MarkerCandidate> candidates;
     auto frame = frame_range.lower;
     while (frame < frame_range.upper) {
+        poll_cancellation(cancellation, frame, frame_range.lower);
         const auto onset_peak = frame_peak(samples, channel_count, frame);
         if (onset_peak <= adaptive_threshold) {
             ++frame;
@@ -406,6 +429,7 @@ void update_alignment_cell(
         auto peak = onset_peak;
         ++frame;
         while (frame < frame_range.upper) {
+            poll_cancellation(cancellation, frame, frame_range.lower);
             const auto next_peak = frame_peak(samples, channel_count, frame);
             if (next_peak <= adaptive_threshold) break;
             peak = std::max(peak, next_peak);
@@ -739,7 +763,9 @@ AudioBuffer materialize_playback_plan(const CapturePassPlaybackPlan& plan) {
 PayloadAlignment align_payload(
     const Float32AudioAsset& recorded,
     const float recording_gain,
-    const AlignmentReference& reference) {
+    const AlignmentReference& reference,
+    const std::shared_ptr<CancellationToken>& cancellation) {
+    throw_if_cancelled(cancellation);
     if (!recorded.valid() || reference.source_frame_count < 0
         || reference.source_start_frame < 0) {
         throw CaptureError(
@@ -783,11 +809,13 @@ PayloadAlignment align_payload(
         std::vector<float> chunk(chunk_frames * channel_count);
         Frame frames_read = 0;
         while (frames_read < window_frames) {
+            throw_if_cancelled(cancellation);
             const auto requested = static_cast<std::size_t>(std::min<Frame>(
                 window_frames - frames_read,
                 static_cast<Frame>(chunk_frames)));
             std::size_t filled = 0;
             while (filled < requested) {
+                throw_if_cancelled(cancellation);
                 const auto sample_offset = filled * channel_count;
                 const auto read = reader->read_frames(
                     std::span<float>(chunk).subspan(
@@ -804,6 +832,10 @@ PayloadAlignment align_payload(
             const auto gain = std::abs(
                 std::isfinite(recording_gain) ? recording_gain : 1.0F);
             for (std::size_t frame = 0; frame < requested; ++frame) {
+                poll_cancellation(
+                    cancellation,
+                    static_cast<Frame>(frame),
+                    0);
                 float frame_peak_level = 0.0F;
                 const auto sample_offset = frame * channel_count;
                 for (std::uint32_t channel = 0; channel < channel_count; ++channel) {
@@ -821,16 +853,20 @@ PayloadAlignment align_payload(
             frames_read += static_cast<Frame>(requested);
         }
     }
+    throw_if_cancelled(cancellation);
     auto marker_candidates = detect_marker_impulse_candidates(
         marker_frame_peaks,
         1,
         {.lower = 0, .upper = static_cast<Frame>(
-            marker_frame_peaks.size())});
+            marker_frame_peaks.size())},
+        cancellation);
     for (auto& candidate : marker_candidates) candidate.frame += search_range.lower;
+    throw_if_cancelled(cancellation);
     const auto selected_sequence = select_marker_sequence(
         marker_candidates,
         reference.expected_marker_frames,
         recorded.sample_rate());
+    throw_if_cancelled(cancellation);
     const auto detected_impulses = selected_sequence.has_value()
         ? selected_sequence->frames()
         : std::vector<Frame>{};
@@ -901,8 +937,13 @@ PayloadAlignment align_payload(
 
 PayloadAlignment align_payload(
     const AudioBuffer& recorded,
-    const AlignmentReference& reference) {
-    return align_payload(Float32AudioAsset::from_memory(recorded), 1.0F, reference);
+    const AlignmentReference& reference,
+    const std::shared_ptr<CancellationToken>& cancellation) {
+    return align_payload(
+        Float32AudioAsset::from_memory(recorded),
+        1.0F,
+        reference,
+        cancellation);
 }
 
 } // namespace capture_panel

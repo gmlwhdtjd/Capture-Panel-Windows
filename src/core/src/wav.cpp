@@ -879,7 +879,7 @@ void write_wav(
     if (!stream) throw_write_error(path, "an I/O error occurred while writing audio data");
     stream.close();
     if (!stream) throw_write_error(path, "an I/O error occurred while closing audio data");
-    if (cancellation && cancellation->is_cancelled()) {
+    if (cancellation && !cancellation->begin_output_commit()) {
         throw CaptureError(ErrorCode::capture_cancelled, "Capture was cancelled.");
     }
     try {

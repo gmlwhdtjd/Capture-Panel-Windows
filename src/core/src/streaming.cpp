@@ -382,6 +382,29 @@ Float32AudioAsset Float32AudioAsset::from_memory(AudioBuffer audio) {
         shared);
 }
 
+Float32AudioAsset Float32AudioAsset::from_reader_factory(
+    const double sample_rate,
+    const std::uint32_t channel_count,
+    const std::int64_t frame_count,
+    ReaderFactory reader_factory,
+    const std::optional<float> raw_peak,
+    std::shared_ptr<void> lifetime) {
+    if (!std::isfinite(sample_rate) || sample_rate <= 0.0 || channel_count == 0
+        || frame_count < 0 || !reader_factory
+        || (raw_peak.has_value()
+            && (!std::isfinite(*raw_peak) || *raw_peak < 0.0F))) {
+        throw_invalid_stream("custom recording metadata or reader factory is invalid");
+    }
+    return Float32AudioAsset(
+        sample_rate,
+        channel_count,
+        frame_count,
+        raw_peak,
+        std::nullopt,
+        std::move(reader_factory),
+        std::move(lifetime));
+}
+
 Float32AudioAsset Float32AudioAsset::from_temporary_file(
     std::filesystem::path path,
     const double sample_rate,

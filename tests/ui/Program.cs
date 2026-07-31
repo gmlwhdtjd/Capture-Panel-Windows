@@ -42,6 +42,9 @@ internal static class Program
             ("failure notification errors preserve the original failure", FailureNotificationErrorsAreNonFatal),
             ("invalid capture results are never promoted", InvalidCaptureResultsAreRejected),
             ("late worker completion cannot win a capture cancellation", LateCaptureCompletionStaysCancelled),
+            ("cancellation after validation deletes the temporary output", CancellationAfterValidationDeletesTemporaryOutput),
+            ("capture commit rejects a late cancellation", CaptureCommitRejectsLateCancellation),
+            ("promotion failure preserves a validated recovery output", PromotionFailurePreservesValidatedOutput),
             ("capture cancellation wins a concurrent worker error", CaptureCancellationWinsConcurrentWorkerError),
             ("capture failure invalidates setup and remains visible", CaptureFailureInvalidatesSetup),
             ("stale channel discovery cannot overwrite a newer device", StaleChannelDiscoveryIsIgnored),
@@ -679,6 +682,11 @@ internal static class Program
     private static async Task LateCaptureCompletionStaysCancelled()
     {
         using var fixture = new Fixture();
+        Fixture.WritePcmWav(
+            fixture.DestinationPath,
+            sampleRate: 48_000,
+            frames: 120);
+        var originalDestination = await File.ReadAllBytesAsync(fixture.DestinationPath);
         fixture.Worker.HoldCaptureCompletion = true;
         fixture.Worker.CreateNativeSiblingTemporary = true;
         using var model = fixture.CreateModel();
@@ -694,8 +702,11 @@ internal static class Program
         await WaitUntil(() => !model.IsCapturing);
         await Task.Delay(100);
 
-        Require(!File.Exists(fixture.DestinationPath),
-            "A cancelled capture must never promote a late temporary result.");
+        Require(File.Exists(fixture.DestinationPath),
+            "Cancelling before commit must preserve an existing destination.");
+        var preservedDestination = await File.ReadAllBytesAsync(fixture.DestinationPath);
+        Require(originalDestination.SequenceEqual(preservedDestination),
+            "Cancelling before commit must not replace the existing destination.");
         Require(!Directory.EnumerateFiles(fixture.DirectoryPath).Any(path =>
                 Path.GetFileName(path).Contains(".capture-panel.tmp.", StringComparison.Ordinal)),
             "A cancelled native atomic write must not leave its inner sibling temp behind.");
@@ -706,6 +717,156 @@ internal static class Program
         Require(model.CanCapture, "Cancellation should preserve the previously verified route.");
         Equal(1, fixture.Notifications.PrepareCalls);
         Equal(0, fixture.Notifications.NotifyCalls);
+    }
+
+    private static async Task CancellationAfterValidationDeletesTemporaryOutput()
+    {
+        using var fixture = new Fixture();
+        Fixture.WritePcmWav(
+            fixture.DestinationPath,
+            sampleRate: 48_000,
+            frames: 120);
+        var originalDestination = await File.ReadAllBytesAsync(fixture.DestinationPath);
+        fixture.Worker.HoldCaptureCompletion = true;
+        var beforeCommitGate = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCommitGate = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var model = new MainViewModel(
+            fixture.Worker,
+            fixture.Settings,
+            fixture.Dialogs,
+            showDevelopmentDevices: true,
+            setupTestTimeout: null,
+            notificationService: fixture.Notifications,
+            captureCommitHooks: new CaptureCommitHooks(
+                BeforeCommitGate: () =>
+                {
+                    beforeCommitGate.TrySetResult();
+                    releaseCommitGate.Task.GetAwaiter().GetResult();
+                }));
+        await model.InitializeAsync();
+        model.ChooseSourceCommand.Execute(null);
+        model.TestCommand.Execute(null);
+        await WaitUntil(() => model.CanCapture);
+
+        model.CaptureCommand.Execute(null);
+        await fixture.Worker.CaptureOutputWritten.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        fixture.Worker.ReleaseCaptureCompletion.TrySetResult();
+        await beforeCommitGate.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        try
+        {
+            Require(model.CanCancelCapture,
+                "Cancellation must remain available before the commit gate is claimed.");
+            model.CaptureCommand.Execute(null);
+            Require(model.IsCancelling,
+                "Cancellation must claim the gate while validated output is waiting.");
+        }
+        finally
+        {
+            releaseCommitGate.TrySetResult();
+        }
+
+        await WaitUntil(() => !model.IsCapturing);
+        var preservedDestination = await File.ReadAllBytesAsync(fixture.DestinationPath);
+        Require(originalDestination.SequenceEqual(preservedDestination),
+            "Cancellation before commit must preserve the existing destination.");
+        Require(!Directory.EnumerateFiles(
+                fixture.DirectoryPath,
+                ".capture-panel-*.tmp.wav").Any(),
+            "Cancellation after validation must delete the WPF temporary output.");
+        Equal("Capture cancelled.", model.Assessment);
+        Require(model.RecoveryOutputPath is null,
+            "A cancelled capture must not advertise a recovery output.");
+        Equal(0, fixture.Notifications.NotifyCalls);
+    }
+
+    private static async Task CaptureCommitRejectsLateCancellation()
+    {
+        using var fixture = new Fixture();
+        fixture.Worker.HoldCaptureCompletion = true;
+        var commitStarted = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseCommit = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var model = new MainViewModel(
+            fixture.Worker,
+            fixture.Settings,
+            fixture.Dialogs,
+            showDevelopmentDevices: true,
+            setupTestTimeout: null,
+            notificationService: fixture.Notifications,
+            captureCommitHooks: new CaptureCommitHooks(
+                AfterCommitStarted: () =>
+                {
+                    commitStarted.TrySetResult();
+                    releaseCommit.Task.GetAwaiter().GetResult();
+                }));
+        await model.InitializeAsync();
+        model.ChooseSourceCommand.Execute(null);
+        model.TestCommand.Execute(null);
+        await WaitUntil(() => model.CanCapture);
+
+        model.CaptureCommand.Execute(null);
+        await fixture.Worker.CaptureOutputWritten.Task.WaitAsync(TimeSpan.FromSeconds(2));
+        fixture.Worker.ReleaseCaptureCompletion.TrySetResult();
+        await commitStarted.Task.WaitAsync(TimeSpan.FromSeconds(2));
+
+        try
+        {
+            Require(!model.CanCancelCapture,
+                "Capture must stop accepting cancellation once destination commit starts.");
+            model.CaptureCommand.Execute(null);
+            Require(!model.IsCancelling,
+                "A late cancellation must not change capture state after commit starts.");
+        }
+        finally
+        {
+            releaseCommit.TrySetResult();
+        }
+
+        await WaitUntil(() => !model.IsCapturing);
+        Equal("Capture saved.", model.Assessment);
+        Equal(fixture.DestinationPath, model.LastOutputPath);
+        Equal(480L, WavMetadataReader.Read(fixture.DestinationPath).Frames);
+        Equal(1, fixture.Notifications.NotifyCalls);
+        Equal(1, fixture.Notifications.SavedFilenames.Count);
+        Equal(0, fixture.Notifications.FailedCaptures.Count);
+    }
+
+    private static async Task PromotionFailurePreservesValidatedOutput()
+    {
+        using var fixture = new Fixture();
+        var occupiedDestination = Path.Combine(
+            fixture.DirectoryPath,
+            "occupied.wav");
+        Directory.CreateDirectory(occupiedDestination);
+        using var model = new MainViewModel(
+            fixture.Worker,
+            fixture.Settings,
+            new FakeFileDialogService(fixture.SourcePath, occupiedDestination),
+            showDevelopmentDevices: true,
+            notificationService: fixture.Notifications);
+        await model.InitializeAsync();
+        model.ChooseSourceCommand.Execute(null);
+        model.TestCommand.Execute(null);
+        await WaitUntil(() => model.CanCapture);
+
+        model.CaptureCommand.Execute(null);
+        await WaitUntil(() => fixture.Worker.CaptureCalls == 1 && !model.IsCapturing);
+
+        var recoveryPath = model.RecoveryOutputPath;
+        Require(recoveryPath is not null,
+            "A promotion failure must expose the validated temporary output for recovery.");
+        Require(File.Exists(recoveryPath!),
+            "The recovery output must remain on disk after promotion fails.");
+        Equal(480L, WavMetadataReader.Read(recoveryPath!).Frames);
+        Require(model.Assessment.Contains(
+                "validated capture was preserved",
+                StringComparison.Ordinal),
+            "The promotion failure must explain where the recovery output was preserved.");
+        Equal(1, fixture.Notifications.FailedCaptures.Count);
     }
 
     private static async Task CaptureFailureInvalidatesSetup()

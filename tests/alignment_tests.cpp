@@ -6,6 +6,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <memory>
+#include <span>
+#include <utility>
 #include <vector>
 
 using namespace capture_panel;
@@ -30,6 +33,50 @@ namespace {
     }
     return true;
 }
+
+struct CancellingReaderState {
+    std::shared_ptr<CancellationToken> cancellation;
+    std::size_t read_call_count = 0;
+};
+
+class CancellingAlignmentReader final : public IFloat32FrameReader {
+public:
+    CancellingAlignmentReader(
+        std::shared_ptr<CancellingReaderState> state,
+        const std::int64_t start_frame,
+        const std::int64_t frame_count)
+        : state_(std::move(state)),
+          cursor_(start_frame),
+          frame_count_(frame_count) {}
+
+    [[nodiscard]] std::uint32_t channel_count() const noexcept override {
+        return 1;
+    }
+
+    std::int64_t read_frames(std::span<float> interleaved_samples) override {
+        if (cursor_ >= frame_count_) return 0;
+        const auto frames = std::min<std::int64_t>({
+            frame_count_ - cursor_,
+            static_cast<std::int64_t>(interleaved_samples.size()),
+            128,
+        });
+        std::fill_n(
+            interleaved_samples.data(),
+            static_cast<std::size_t>(frames),
+            0.0F);
+        cursor_ += frames;
+        ++state_->read_call_count;
+        if (state_->read_call_count == 2) {
+            static_cast<void>(state_->cancellation->cancel());
+        }
+        return frames;
+    }
+
+private:
+    std::shared_ptr<CancellingReaderState> state_;
+    std::int64_t cursor_ = 0;
+    std::int64_t frame_count_ = 0;
+};
 
 } // namespace
 
@@ -349,4 +396,38 @@ CP_TEST_CASE("payload alignment zero pads when an aligned recording ends early")
     CP_REQUIRE(samples_near(
         result.payload.materialize().samples,
         std::vector<float>{0.1F, 0.2F, 0.3F, 0.0F, 0.0F, 0.0F}));
+}
+
+CP_TEST_CASE("payload alignment observes cancellation between reader chunks") {
+    constexpr std::int64_t frame_count = 1'100;
+    const auto cancellation = std::make_shared<CancellationToken>();
+    const auto state = std::make_shared<CancellingReaderState>(
+        CancellingReaderState{.cancellation = cancellation});
+    const auto recorded = Float32AudioAsset::from_reader_factory(
+        1'000.0,
+        1,
+        frame_count,
+        [state, frame_count](const std::int64_t start_frame) {
+            return std::make_unique<CancellingAlignmentReader>(
+                state, start_frame, frame_count);
+        });
+
+    bool cancelled = false;
+    try {
+        static_cast<void>(align_payload(
+            recorded,
+            1.0F,
+            AlignmentReference{
+                .expected_marker_frames = {100, 200, 300, 400, 500},
+                .source_start_frame = 900,
+                .source_frame_count = 4,
+            },
+            cancellation));
+    } catch (const CaptureError& error) {
+        cancelled = error.code() == ErrorCode::capture_cancelled;
+    }
+
+    CP_REQUIRE(cancelled);
+    CP_REQUIRE(cancellation->is_cancelled());
+    CP_REQUIRE(state->read_call_count == 2);
 }

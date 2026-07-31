@@ -4,6 +4,7 @@
 #include "capture_panel/core/types.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <vector>
 
@@ -63,11 +64,13 @@ struct PayloadAlignment {
 [[nodiscard]] PayloadAlignment align_payload(
     const Float32AudioAsset& recorded,
     float recording_gain,
-    const AlignmentReference& reference);
+    const AlignmentReference& reference,
+    const std::shared_ptr<CancellationToken>& cancellation = {});
 
 // Compatibility overload for bounded in-memory tests.
 [[nodiscard]] PayloadAlignment align_payload(
     const AudioBuffer& recorded,
-    const AlignmentReference& reference);
+    const AlignmentReference& reference,
+    const std::shared_ptr<CancellationToken>& cancellation = {});
 
 } // namespace capture_panel

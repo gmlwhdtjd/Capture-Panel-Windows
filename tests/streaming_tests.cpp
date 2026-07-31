@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -15,6 +16,7 @@
 #include <span>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -71,6 +73,40 @@ private:
     std::vector<float> samples_;
     std::uint32_t channels_ = 0;
     std::size_t max_frames_per_read_ = 0;
+    std::size_t offset_ = 0;
+};
+
+class CancelAfterFinalReadReader final : public IFloat32FrameReader {
+public:
+    CancelAfterFinalReadReader(
+        std::vector<float> samples,
+        const std::uint32_t channels,
+        std::shared_ptr<CancellationToken> cancellation)
+        : samples_(std::move(samples)),
+          channels_(channels),
+          cancellation_(std::move(cancellation)) {}
+
+    [[nodiscard]] std::uint32_t channel_count() const noexcept override {
+        return channels_;
+    }
+
+    std::int64_t read_frames(std::span<float> destination) override {
+        const auto available_frames = (samples_.size() - offset_) / channels_;
+        const auto requested_frames = destination.size() / channels_;
+        const auto frames = std::min(available_frames, requested_frames);
+        const auto sample_count = frames * channels_;
+        std::copy_n(samples_.data() + offset_, sample_count, destination.data());
+        offset_ += sample_count;
+        if (offset_ == samples_.size()) {
+            static_cast<void>(cancellation_->cancel());
+        }
+        return static_cast<std::int64_t>(frames);
+    }
+
+private:
+    std::vector<float> samples_;
+    std::uint32_t channels_ = 0;
+    std::shared_ptr<CancellationToken> cancellation_;
     std::size_t offset_ = 0;
 };
 
@@ -178,12 +214,53 @@ CP_TEST_CASE("streaming WAV writer accepts partial reads and writes odd PCM24 pa
     CP_REQUIRE(std::filesystem::file_size(file.path) == 54);
 }
 
-CP_TEST_CASE("streaming WAV cancellation preserves an existing destination") {
+CP_TEST_CASE("cancellation wins before output commit") {
+    CancellationToken cancellation;
+
+    CP_REQUIRE(cancellation.cancel());
+    CP_REQUIRE(cancellation.is_cancelled());
+    CP_REQUIRE(!cancellation.cancel());
+    CP_REQUIRE(!cancellation.begin_output_commit());
+}
+
+CP_TEST_CASE("output commit wins before cancellation") {
+    CancellationToken cancellation;
+
+    CP_REQUIRE(cancellation.begin_output_commit());
+    CP_REQUIRE(!cancellation.is_cancelled());
+    CP_REQUIRE(!cancellation.cancel());
+    CP_REQUIRE(cancellation.begin_output_commit());
+}
+
+CP_TEST_CASE("output commit and cancellation choose exactly one winner") {
+    for (int attempt = 0; attempt < 256; ++attempt) {
+        CancellationToken cancellation;
+        std::barrier start{3};
+        bool cancellation_won = false;
+        bool commit_won = false;
+
+        std::thread cancel_thread([&] {
+            start.arrive_and_wait();
+            cancellation_won = cancellation.cancel();
+        });
+        std::thread commit_thread([&] {
+            start.arrive_and_wait();
+            commit_won = cancellation.begin_output_commit();
+        });
+        start.arrive_and_wait();
+        cancel_thread.join();
+        commit_thread.join();
+
+        CP_REQUIRE(cancellation_won != commit_won);
+        CP_REQUIRE(cancellation.is_cancelled() == cancellation_won);
+    }
+}
+
+CP_TEST_CASE("streaming WAV cancellation preserves destination and removes sibling temp") {
     TemporaryFile file("-cancel.wav");
     write_wav(file.path, std::vector<float>{0.125F}, 48'000.0, 1);
-    PartialVectorReader reader({0.75F, 0.5F}, 1, 1);
     const auto cancellation = std::make_shared<CancellationToken>();
-    cancellation->cancel();
+    CancelAfterFinalReadReader reader({0.75F, 0.5F}, 1, cancellation);
 
     CP_REQUIRE(throws_code(
         [&] {
@@ -197,9 +274,15 @@ CP_TEST_CASE("streaming WAV cancellation preserves an existing destination") {
                 cancellation);
         },
         ErrorCode::capture_cancelled));
+    CP_REQUIRE(cancellation->is_cancelled());
     const auto preserved = read_wav(file.path);
     CP_REQUIRE(preserved.audio.frame_count() == 1);
     CP_REQUIRE_NEAR(preserved.audio.samples.front(), 0.125, 0.00001);
+
+    const auto prefix = file.path.filename().native() + L".capture-panel.tmp.";
+    for (const auto& entry : std::filesystem::directory_iterator(file.path.parent_path())) {
+        CP_REQUIRE(!entry.path().filename().native().starts_with(prefix));
+    }
 }
 
 CP_TEST_CASE("RIFF preflight rejects byte-rate and data-size overflow") {

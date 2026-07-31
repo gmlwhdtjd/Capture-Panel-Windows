@@ -402,6 +402,37 @@ CP_TEST_CASE("CaptureService propagates cancellation from the fake backend") {
     CP_REQUIRE(!std::filesystem::exists(files.output));
 }
 
+CP_TEST_CASE("CaptureService observes cancellation when alignment starts") {
+    TemporaryWavPair files("capture-panel-cancel-during-alignment");
+    write_wav(files.input, sine_source(48'000.0, 1'000), AudioBitDepth::pcm24);
+
+    auto backend = std::make_shared<capture_panel::fake::FakeAudioBackend>();
+    auto cancellation = std::make_shared<CancellationToken>();
+    bool alignment_started = false;
+    bool output_writing_started = false;
+    CaptureService service(backend, backend, [&](const CaptureEvent& event) {
+        if (event.type != CaptureEventType::stage_changed || !event.stage) return;
+        if (*event.stage == CaptureStage::alignment) {
+            alignment_started = true;
+            static_cast<void>(cancellation->cancel());
+        } else if (*event.stage == CaptureStage::output_writing) {
+            output_writing_started = true;
+        }
+    });
+
+    bool cancelled = false;
+    try {
+        static_cast<void>(service.capture(configuration_for(files), {}, cancellation));
+    } catch (const CaptureError& error) {
+        cancelled = error.code() == ErrorCode::capture_cancelled;
+    }
+
+    CP_REQUIRE(cancelled);
+    CP_REQUIRE(alignment_started);
+    CP_REQUIRE(!output_writing_started);
+    CP_REQUIRE(!std::filesystem::exists(files.output));
+}
+
 CP_TEST_CASE("CaptureService cancellation before rate configuration has no device side effect") {
     TemporaryWavPair files("capture-panel-cancel-before-rate");
     write_wav(files.input, sine_source(44'100.0, 441), AudioBitDepth::pcm24);
@@ -454,6 +485,43 @@ CP_TEST_CASE("CaptureService setup cancellation before rate configuration has no
         backend->device(std::string(capture_panel::fake::loopback_device_id)).sample_rate,
         48'000.0,
         0.5);
+}
+
+CP_TEST_CASE("CaptureService setup observes cancellation when alignment starts") {
+    auto backend = std::make_shared<capture_panel::fake::FakeAudioBackend>();
+    auto cancellation = std::make_shared<CancellationToken>();
+    bool alignment_started = false;
+    bool verification_started = false;
+    CaptureService service(backend, backend, [&](const CaptureEvent& event) {
+        if (event.type != CaptureEventType::stage_changed || !event.stage) return;
+        if (*event.stage == CaptureStage::alignment) {
+            alignment_started = true;
+            static_cast<void>(cancellation->cancel());
+        } else if (*event.stage == CaptureStage::verification) {
+            verification_started = true;
+        }
+    });
+
+    bool cancelled = false;
+    try {
+        static_cast<void>(service.verify_setup(
+            {
+                .driver_id = std::string(capture_panel::fake::loopback_device_id),
+                .playback_channels = {1},
+                .record_channels = {1},
+            },
+            std::nullopt,
+            0.0,
+            0.0,
+            {},
+            cancellation));
+    } catch (const CaptureError& error) {
+        cancelled = error.code() == ErrorCode::capture_cancelled;
+    }
+
+    CP_REQUIRE(cancelled);
+    CP_REQUIRE(alignment_started);
+    CP_REQUIRE(!verification_started);
 }
 
 CP_TEST_CASE("CaptureService rejects a zero-frame source before capture") {

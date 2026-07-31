@@ -97,13 +97,40 @@ struct CapturePassOptions {
 
 class CancellationToken {
 public:
-    void cancel() noexcept { cancelled_.store(true, std::memory_order_release); }
+    bool cancel() noexcept {
+        auto expected = State::active;
+        return state_.compare_exchange_strong(
+            expected,
+            State::cancelled,
+            std::memory_order_acq_rel,
+            std::memory_order_acquire);
+    }
+
     [[nodiscard]] bool is_cancelled() const noexcept {
-        return cancelled_.load(std::memory_order_acquire);
+        return state_.load(std::memory_order_acquire) == State::cancelled;
+    }
+
+    [[nodiscard]] bool begin_output_commit() noexcept {
+        auto expected = State::active;
+        if (state_.compare_exchange_strong(
+                expected,
+                State::output_committing,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
+            return true;
+        }
+        return expected == State::output_committing;
     }
 
 private:
-    std::atomic_bool cancelled_{false};
+    enum class State : std::uint8_t {
+        active,
+        cancelled,
+        output_committing,
+    };
+
+    static_assert(std::atomic<State>::is_always_lock_free);
+    std::atomic<State> state_{State::active};
 };
 
 enum class CaptureWarning {

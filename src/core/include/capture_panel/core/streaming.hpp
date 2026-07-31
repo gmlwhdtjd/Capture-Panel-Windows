@@ -70,9 +70,22 @@ private:
 /// and the file is removed when the last asset/payload reference is released.
 class Float32AudioAsset {
 public:
+    using ReaderFactory = std::function<
+        std::unique_ptr<IFloat32FrameReader>(std::int64_t)>;
+
     Float32AudioAsset() = default;
 
     [[nodiscard]] static Float32AudioAsset from_memory(AudioBuffer audio);
+    /// Creates a descriptor backed by a reopenable reader factory. This is
+    /// useful for capture backends whose storage is neither memory nor the
+    /// built-in temporary Float32 file.
+    [[nodiscard]] static Float32AudioAsset from_reader_factory(
+        double sample_rate,
+        std::uint32_t channel_count,
+        std::int64_t frame_count,
+        ReaderFactory reader_factory,
+        std::optional<float> raw_peak = {},
+        std::shared_ptr<void> lifetime = {});
     [[nodiscard]] static Float32AudioAsset from_temporary_file(
         std::filesystem::path path,
         double sample_rate,
@@ -99,9 +112,6 @@ public:
         const std::shared_ptr<CancellationToken>& cancellation = {}) const;
 
 private:
-    using ReaderFactory = std::function<
-        std::unique_ptr<IFloat32FrameReader>(std::int64_t)>;
-
     Float32AudioAsset(
         double sample_rate,
         std::uint32_t channel_count,

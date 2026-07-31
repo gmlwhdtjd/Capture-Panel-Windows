@@ -512,15 +512,17 @@ CapturePassResult CaptureService::capture(
     emit({.type = CaptureEventType::stage_changed, .stage = CaptureStage::alignment});
     auto alignment = align_payload(
         raw.recorded,
-        static_cast<float>(linear_from_dbfs(options.recording_gain_db)), {
-        .expected_marker_frames = [&] {
-            auto frames = plan.marker_frames;
-            for (auto& frame : frames) frame += raw.pre_pad_frames;
-            return frames;
-        }(),
-        .source_start_frame = raw.pre_pad_frames + plan.source_start_frame,
-        .source_frame_count = source.input.format.total_frames,
-    });
+        static_cast<float>(linear_from_dbfs(options.recording_gain_db)),
+        {
+            .expected_marker_frames = [&] {
+                auto frames = plan.marker_frames;
+                for (auto& frame : frames) frame += raw.pre_pad_frames;
+                return frames;
+            }(),
+            .source_start_frame = raw.pre_pad_frames + plan.source_start_frame,
+            .source_frame_count = source.input.format.total_frames,
+        },
+        cancellation);
 
     if (alignment.impulse_detection) {
         emit({
@@ -680,15 +682,17 @@ CaptureVerificationResult CaptureService::verify_setup(
     emit({.type = CaptureEventType::stage_changed, .stage = CaptureStage::alignment});
     auto alignment = align_payload(
         raw.recorded,
-        static_cast<float>(linear_from_dbfs(options.recording_gain_db)), {
-        .expected_marker_frames = [&] {
-            auto frames = plan.marker_frames;
-            for (auto& frame : frames) frame += raw.pre_pad_frames;
-            return frames;
-        }(),
-        .source_start_frame = raw.pre_pad_frames + plan.source_start_frame,
-        .source_frame_count = signal.audio.frame_count(),
-    });
+        static_cast<float>(linear_from_dbfs(options.recording_gain_db)),
+        {
+            .expected_marker_frames = [&] {
+                auto frames = plan.marker_frames;
+                for (auto& frame : frames) frame += raw.pre_pad_frames;
+                return frames;
+            }(),
+            .source_start_frame = raw.pre_pad_frames + plan.source_start_frame,
+            .source_frame_count = signal.audio.frame_count(),
+        },
+        cancellation);
     if (alignment.impulse_detection) {
         emit({
             .type = CaptureEventType::impulse_detection,

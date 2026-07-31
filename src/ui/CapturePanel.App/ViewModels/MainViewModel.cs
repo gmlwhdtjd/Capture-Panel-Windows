@@ -1,9 +1,12 @@
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.IO;
+using System.Runtime.CompilerServices;
 using CapturePanel.App.Infrastructure;
 using CapturePanel.App.Models;
 using CapturePanel.App.Services;
+
+[assembly: InternalsVisibleTo("CapturePanel.App.Tests")]
 
 namespace CapturePanel.App.ViewModels;
 
@@ -16,8 +19,10 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private readonly IAppSettingsStore _settingsStore;
     private readonly IFileDialogService _fileDialogs;
     private readonly ICaptureNotificationService _notificationService;
+    private readonly CaptureCommitHooks? _captureCommitHooks;
     private readonly bool _showDevelopmentDevices;
     private readonly TimeSpan _setupTestTimeout;
+    private readonly object _captureCommitSync = new();
     private AppSettings _settings;
     private AudioDeviceInfo? _selectedOutputDevice;
     private AudioChannelInfo? _selectedPlaybackChannel;
@@ -50,6 +55,7 @@ public sealed class MainViewModel : ObservableObject, IDisposable
     private CancellationTokenSource? _operationCancellation;
     private CancellationTokenSource? _deviceCancellation;
     private CancellationTokenSource? _channelCancellation;
+    private CaptureCommitState _captureCommitState;
     private bool _suppressConfigurationChanges;
     private bool _disposed;
 
@@ -60,11 +66,31 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         bool showDevelopmentDevices = false,
         TimeSpan? setupTestTimeout = null,
         ICaptureNotificationService? notificationService = null)
+        : this(
+            worker,
+            settingsStore,
+            fileDialogs,
+            showDevelopmentDevices,
+            setupTestTimeout,
+            notificationService,
+            captureCommitHooks: null)
+    {
+    }
+
+    internal MainViewModel(
+        ICaptureWorkerClient worker,
+        IAppSettingsStore settingsStore,
+        IFileDialogService fileDialogs,
+        bool showDevelopmentDevices,
+        TimeSpan? setupTestTimeout,
+        ICaptureNotificationService? notificationService,
+        CaptureCommitHooks? captureCommitHooks)
     {
         _worker = worker;
         _settingsStore = settingsStore;
         _fileDialogs = fileDialogs;
         _notificationService = notificationService ?? DisabledCaptureNotificationService.Instance;
+        _captureCommitHooks = captureCommitHooks;
         _showDevelopmentDevices = showDevelopmentDevices;
         _setupTestTimeout = setupTestTimeout ?? TimeSpan.FromSeconds(30);
         if (_setupTestTimeout <= TimeSpan.Zero)
@@ -469,7 +495,18 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         && SelectedRecordChannel is not null;
     public bool CanTest => AudioReady && SourceReady && !ControlsLocked;
     public bool CanCapture => AudioReady && SourceReady && CaptureSetupVerified && !ControlsLocked;
-    public bool CanCancelCapture => IsCapturing && !IsCancelling;
+    public bool CanCancelCapture
+    {
+        get
+        {
+            lock (_captureCommitSync)
+            {
+                return IsCapturing
+                    && !IsCancelling
+                    && _captureCommitState == CaptureCommitState.Active;
+            }
+        }
+    }
     public string CaptureButtonText => IsCapturing ? "Cancel" : "Capture";
     public SetupInputLevel LevelState
     {
@@ -877,10 +914,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
 
         var operationCancellation = new CancellationTokenSource();
-        _operationCancellation = operationCancellation;
+        lock (_captureCommitSync)
+        {
+            _operationCancellation = operationCancellation;
+            _captureCommitState = CaptureCommitState.Active;
+        }
         var operationToken = operationCancellation.Token;
         var validatedOutput = false;
-        var promotedOutput = false;
+        var commitStarted = false;
+        var temporaryOutputDisposition = TemporaryOutputDisposition.Delete;
         var notifyCaptureFailure = true;
         var captureFailureReason = "The capture could not be completed.";
         PrepareCaptureNotification();
@@ -937,8 +979,14 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             }
             validatedOutput = true;
 
+            _captureCommitHooks?.BeforeCommitGate?.Invoke();
+            if (!TryBeginCaptureCommit(operationCancellation))
+            {
+                throw new OperationCanceledException(operationToken);
+            }
+            commitStarted = true;
+            _captureCommitHooks?.AfterCommitStarted?.Invoke();
             File.Move(temporaryPath, fullDestination, overwrite: true);
-            promotedOutput = true;
             LastOutputPath = fullDestination;
             CaptureWarningMessage = completed.Warnings.Count == 0
                 ? null
@@ -967,9 +1015,15 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         {
             captureFailureReason = exception.Message;
             ProgressLabel = "Failed";
-            var recovery = validatedOutput && File.Exists(temporaryPath)
+            var recovery = validatedOutput
+                && commitStarted
+                && File.Exists(temporaryPath)
                 ? temporaryPath
                 : null;
+            if (recovery is not null)
+            {
+                temporaryOutputDisposition = TemporaryOutputDisposition.PreserveForRecovery;
+            }
             RecoveryOutputPath = recovery;
             var message = recovery is null
                 ? $"Capture failed: {exception.Message}"
@@ -988,16 +1042,20 @@ public sealed class MainViewModel : ObservableObject, IDisposable
         }
         finally
         {
+            lock (_captureCommitSync)
+            {
+                if (ReferenceEquals(_operationCancellation, operationCancellation))
+                {
+                    _captureCommitState = CaptureCommitState.Idle;
+                    _operationCancellation = null;
+                }
+            }
             TryDeleteNativeSiblingTemporaryFiles(temporaryPath);
-            if (!validatedOutput || promotedOutput)
+            if (temporaryOutputDisposition == TemporaryOutputDisposition.Delete)
             {
                 TryDelete(temporaryPath);
             }
             operationCancellation.Dispose();
-            if (ReferenceEquals(_operationCancellation, operationCancellation))
-            {
-                _operationCancellation = null;
-            }
             if (notifyCaptureFailure)
             {
                 NotifyCaptureFailed(sourceFilename, captureFailureReason);
@@ -1012,15 +1070,52 @@ public sealed class MainViewModel : ObservableObject, IDisposable
 
     private void CancelCapture()
     {
-        if (!CanCancelCapture)
+        CancellationTokenSource? operationCancellation;
+        lock (_captureCommitSync)
         {
-            return;
+            if (!IsCapturing
+                || IsCancelling
+                || _captureCommitState != CaptureCommitState.Active)
+            {
+                return;
+            }
+
+            _captureCommitState = CaptureCommitState.CancellationRequested;
+            operationCancellation = _operationCancellation;
         }
 
         IsCancelling = true;
         ProgressLabel = "Cancelling...";
         RemainingSeconds = null;
-        _operationCancellation?.Cancel();
+        try
+        {
+            operationCancellation?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // The operation completed after cancellation claimed the gate.
+        }
+    }
+
+    private bool TryBeginCaptureCommit(CancellationTokenSource operationCancellation)
+    {
+        var commitStarted = false;
+        lock (_captureCommitSync)
+        {
+            if (ReferenceEquals(_operationCancellation, operationCancellation)
+                && _captureCommitState == CaptureCommitState.Active
+                && !operationCancellation.IsCancellationRequested)
+            {
+                _captureCommitState = CaptureCommitState.CommitStarted;
+                commitStarted = true;
+            }
+        }
+
+        if (commitStarted)
+        {
+            NotifyStateChanged();
+        }
+        return commitStarted;
     }
 
     private void PrepareCaptureNotification()
@@ -1660,11 +1755,40 @@ public sealed class MainViewModel : ObservableObject, IDisposable
             return;
         }
         _disposed = true;
-        _operationCancellation?.Cancel();
-        _operationCancellation?.Dispose();
+        CancellationTokenSource? operationCancellation;
+        lock (_captureCommitSync)
+        {
+            operationCancellation = _captureCommitState == CaptureCommitState.CommitStarted
+                ? null
+                : _operationCancellation;
+            if (_captureCommitState == CaptureCommitState.Active)
+            {
+                _captureCommitState = CaptureCommitState.CancellationRequested;
+            }
+        }
+        operationCancellation?.Cancel();
+        operationCancellation?.Dispose();
         _deviceCancellation?.Cancel();
         _deviceCancellation?.Dispose();
         _channelCancellation?.Cancel();
         _channelCancellation?.Dispose();
     }
+
+    private enum CaptureCommitState
+    {
+        Idle,
+        Active,
+        CancellationRequested,
+        CommitStarted,
+    }
+
+    private enum TemporaryOutputDisposition
+    {
+        Delete,
+        PreserveForRecovery,
+    }
 }
+
+internal sealed record CaptureCommitHooks(
+    Action? BeforeCommitGate = null,
+    Action? AfterCommitStarted = null);
